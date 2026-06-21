@@ -1,0 +1,26 @@
+# Pinned to the versions I built and tested against (Python 3.12).
+
+# Orchestration
+langchain==1.3.10
+langchain-core==1.4.8
+langchain-text-splitters==1.1.2
+langgraph==1.2.6
+
+# Models
+langchain-anthropic==1.4.6
+langchain-huggingface==1.2.2
+sentence-transformers==5.6.0
+
+# Vector store
+langchain-pinecone==0.2.13
+pinecone==7.3.0
+
+# PDF parsing (ingestion only, but cheap to keep installed)
+pymupdf==1.27.2.3
+
+# UI
+chainlit==2.11.1
+
+# Config / utils
+python-dotenv==1.2.1
+PyYAML==6.0.3
