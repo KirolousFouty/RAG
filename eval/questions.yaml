@@ -1,0 +1,25 @@
+# Small evaluation set for my offline retrieval experiments.
+# Each question has the printed page(s) where the guide actually answers it, which
+# I confirmed by reading the source. `hit@k` = the expected page appears in the top-k
+# retrieved chunks. Used by eval/run_eval.py to compare chunking and embedding choices.
+
+- q: "How do I unlock my iPhone with my fingerprint?"
+  pages: [38]
+- q: "How do I silence calls and alerts when I'm sleeping?"
+  pages: [32]
+- q: "How can I share photos wirelessly with someone nearby?"
+  pages: [33]
+- q: "How do I share my iPhone's internet connection with my laptop?"
+  pages: [33, 34]
+- q: "What can I do if I lose my iPhone?"
+  pages: [39]
+- q: "How do I ask Siri to do something?"
+  pages: [41]
+- q: "How do I open Control Center?"
+  pages: [30]
+- q: "How do I take a panorama photo?"
+  pages: [79]
+- q: "How do I make the screen brighter?"
+  pages: [25]
+- q: "How do I set a passcode on my iPhone?"
+  pages: [37]
