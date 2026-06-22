@@ -47,10 +47,12 @@ class Settings:
 
     # --- Retrieval / generation ---
     top_k: int = _int("TOP_K", 5)
-    # Below this best-match cosine score I treat retrieval as "nothing relevant" and
-    # refuse rather than answer from a weak hit. First guess — I'll revisit it once
-    # I've measured the real in-scope vs out-of-scope score distributions.
-    min_relevance_score: float = float(os.getenv("MIN_RELEVANCE_SCORE", "0.32"))
+    # Coarse pre-filter: below this best-match cosine score I treat retrieval as
+    # "nothing relevant" and refuse before even calling the model. bge similarities
+    # sit high (~0.5 even for unrelated text), so this only catches the obviously
+    # off-topic; the authoritative grounding check is the model's refusal instruction
+    # over the actual excerpts. Both numbers are justified in docs/retrieval.md.
+    min_relevance_score: float = float(os.getenv("MIN_RELEVANCE_SCORE", "0.55"))
 
     # --- UI ---
     port: int = _int("PORT", 8000)
