@@ -1,7 +1,6 @@
 .git
 .gitignore
 .env
-__pycache__
 **/__pycache__
 *.pyc
 .venv
@@ -10,4 +9,6 @@ venv
 .files
 .cache
 models
-.DS_Store
+**/.DS_Store
+.claude
+chatbot-source.zip

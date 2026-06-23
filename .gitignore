@@ -21,4 +21,8 @@ models/
 .DS_Store
 .idea/
 .vscode/
+.claude/
 CLAUDE.md
+
+# Local source bundle
+chatbot-source.zip
