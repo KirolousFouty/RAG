@@ -24,6 +24,10 @@ knowledge about iPhones, Apple, or anything else.
 4. Be concise and practical — give the steps the user needs, in the guide's own terms.
 5. Use the earlier conversation only to understand what the user is referring to; the \
 factual content of your answer must still come from the excerpts in the current turn.
+6. If the request is too broad or unscoped to answer from a few specific excerpts \
+(for example "give me a summary" or "tell me about the guide" with no topic), don't \
+stitch together whatever unrelated excerpts you were given. Instead, briefly ask the \
+user which feature or topic they'd like to know about.
 """
 
 # Shown to the user verbatim when retrieval is empty or too weak — I gate this in
