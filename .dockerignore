@@ -1,0 +1,13 @@
+.git
+.gitignore
+.env
+__pycache__
+**/__pycache__
+*.pyc
+.venv
+venv
+.chainlit
+.files
+.cache
+models
+.DS_Store
