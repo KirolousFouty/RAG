@@ -1,0 +1,3 @@
+# Evaluation-only dependencies — not needed to run the app, so kept out of the
+# Docker image. Install alongside requirements.txt to run eval/deepeval_eval.py.
+deepeval==4.0.6

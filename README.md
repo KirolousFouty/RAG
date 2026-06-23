@@ -133,8 +133,17 @@ python -m src.ingest --recreate # delete and rebuild from scratch
 
 ## Reproducing the experiments
 
+Two layers of evaluation (see [`docs/evaluation.md`](docs/evaluation.md)):
+
 ```bash
-python -m eval.run_eval         # offline chunking + embedding benchmark (no cloud, no API calls)
+# 1. Retrieval benchmark — offline, no cloud, no API calls
+python -m eval.run_eval
+
+# 2. LLM-answer evaluation with DeepEval — needs .env (live index + chat model)
+pip install -r requirements-eval.txt
+python -m eval.deepeval_eval
 ```
 
-This prints the hit@5 / MRR tables quoted in the design notes.
+`run_eval` prints the hit@5 / MRR tables quoted in the design notes. `deepeval_eval`
+scores the generated answers for faithfulness (groundedness), answer relevancy, and
+contextual relevancy, using Claude itself as the judge.

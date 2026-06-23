@@ -11,6 +11,8 @@ stands on its own; this page is just the map.
   PDF-parsing gotchas I hit, and what metadata I store per chunk (and why).
 - [retrieval.md](retrieval.md) — the LangGraph pipeline, multi-turn memory, the
   two-layer strict-grounding design, and how citations are produced.
+- [evaluation.md](evaluation.md) — the two evaluation layers: the offline retrieval
+  benchmark and the DeepEval LLM-answer scoring (faithfulness / relevancy).
 
 ## How the pieces fit
 
