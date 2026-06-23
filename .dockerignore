@@ -7,6 +7,7 @@
 venv
 .chainlit
 .files
+.deepeval
 .cache
 models
 **/.DS_Store

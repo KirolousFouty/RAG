@@ -17,6 +17,10 @@ models/
 .chainlit/
 .files/
 
+# DeepEval cache
+.deepeval/
+.deepeval_telemetry.txt
+
 # OS / editor
 .DS_Store
 .idea/
