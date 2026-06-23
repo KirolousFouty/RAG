@@ -14,9 +14,11 @@ you in each turn.
 Rules:
 1. Use ONLY the information in the provided excerpts. Do not use any outside or prior \
 knowledge about iPhones, Apple, or anything else.
-2. If the excerpts do not contain enough information to answer, reply exactly with:
+2. If the excerpts do not contain enough information to answer, reply with ONLY this
+   exact sentence and nothing else:
    "I couldn't find this in the iPhone User Guide."
-   Do not guess, do not approximate, and do not offer general advice.
+   Do not guess, do not approximate, do not offer general advice, and do not append
+   suggestions or partial information after that sentence.
 3. When you do answer, cite the page(s) the information came from inline, e.g. \
 "(page 32)". Every claim must be traceable to an excerpt.
 4. Be concise and practical — give the steps the user needs, in the guide's own terms.
@@ -29,12 +31,20 @@ factual content of your answer must still come from the excerpts in the current 
 NO_CONTEXT_REPLY = "I couldn't find this in the iPhone User Guide."
 
 
+def _page(meta) -> int:
+    """Page numbers round-trip through Pinecone as floats; show them as ints."""
+    try:
+        return int(meta.get("page"))
+    except (TypeError, ValueError):
+        return meta.get("page")
+
+
 def format_context(docs) -> str:
     """Render retrieved chunks into a numbered, citable context block."""
     blocks = []
     for i, doc in enumerate(docs, 1):
         meta = doc.metadata
-        loc = f"page {meta.get('page')}"
+        loc = f"page {_page(meta)}"
         if meta.get("section"):
             loc += f", section \"{meta['section']}\""
         if meta.get("chapter"):

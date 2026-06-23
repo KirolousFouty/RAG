@@ -17,6 +17,7 @@ Multi-turn memory has two parts:
 
 from __future__ import annotations
 
+import re
 from typing import TypedDict
 
 from langchain_anthropic import ChatAnthropic
@@ -106,10 +107,12 @@ class RagPipeline:
         answer = self.llm.invoke(messages).content.strip()
 
         # If the model decided the excerpts don't answer the question, treat it as a
-        # refusal and drop the citations — never cite sources for a non-answer.
-        if answer == NO_CONTEXT_REPLY or not answer:
+        # refusal and drop the citations — never cite sources for a non-answer. I match
+        # on the prefix and normalise to the exact line, so an off-topic question that
+        # the model partly hedges on still collapses to a clean fallback.
+        if not answer or answer.startswith(NO_CONTEXT_REPLY):
             return {"answer": NO_CONTEXT_REPLY, "sources": [], "grounded": False}
-        return {"answer": answer, "sources": _sources(docs), "grounded": True}
+        return {"answer": answer, "sources": _sources(docs, answer), "grounded": True}
 
     # --- wiring ---
     def _build(self):
@@ -136,18 +139,37 @@ class RagPipeline:
             "answer": result["answer"],
             "sources": result.get("sources", []),
             "grounded": result.get("grounded", False),
+            # the retrieved passages, exposed for evaluation (DeepEval faithfulness)
+            "context": [d.page_content for d in result.get("documents", [])],
         }
 
 
-def _sources(docs: list[Document]) -> list[dict]:
-    """Unique, page-ordered citations from the chunks that fed the answer."""
+def _sources(docs: list[Document], answer: str = "") -> list[dict]:
+    """Unique, page-ordered citations.
+
+    If the answer cited pages inline (it is instructed to), I restrict the Sources
+    block to exactly those pages so it matches the answer instead of listing every
+    retrieved chunk — including the tangential ones top-k always drags along. If the
+    model cited nothing, I fall back to all retrieved pages.
+    """
+    cited = {int(n) for n in re.findall(r"page\s+(\d+)", answer)}
+
+    def page(meta) -> int:
+        try:
+            return int(meta.get("page"))
+        except (TypeError, ValueError):
+            return meta.get("page")
+
     seen = {}
     for doc in docs:
         meta = doc.metadata
-        key = (meta.get("page"), meta.get("section"))
+        p = page(meta)
+        if cited and p not in cited:
+            continue
+        key = (p, meta.get("section"))
         if key not in seen:
             seen[key] = {
-                "page": meta.get("page"),
+                "page": p,
                 "section": meta.get("section", ""),
                 "chapter": meta.get("chapter", ""),
             }
