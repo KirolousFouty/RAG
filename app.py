@@ -51,17 +51,16 @@ async def on_message(message: cl.Message):
     history: list[dict] = cl.user_session.get("history")
     question = message.content
 
-    thinking = cl.Message(content="")
-    await thinking.send()
-
+    # No placeholder message here: leaving the turn pending lets Chainlit show its
+    # native animated "thinking" loader while the (synchronous) pipeline runs on a
+    # thread. Sending an empty message instead would replace that with a static bubble.
     result = await cl.make_async(pipeline.answer)(question, history)
 
     answer = result["answer"]
     if result["grounded"] and result["sources"]:
         answer = f"{answer}\n\n{_format_sources(result['sources'])}"
 
-    thinking.content = answer
-    await thinking.update()
+    await cl.Message(content=answer).send()
 
     # Persist the turn so the next question has the conversation as context.
     history.append({"role": "user", "content": question})

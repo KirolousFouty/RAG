@@ -1,0 +1,15 @@
+/* Bottom-anchor the conversation.
+ *
+ * Chainlit's message list is a flex column that fills from the top, which leaves a
+ * large empty area under short conversations. Pushing the first child down with an
+ * auto top-margin pins the messages to the bottom (just above the composer) and lets
+ * them grow upward like a normal chat. When the thread gets long enough to overflow,
+ * the auto margin collapses and normal scrolling takes over.
+ *
+ * The selector targets the main message scroll container by its Tailwind class set;
+ * the settings/sidebar panels use a `data-[state=active]:flex` variant instead of a
+ * bare `flex` class, so they are not affected.
+ */
+.flex.flex-col.flex-grow.overflow-y-auto > :first-child {
+  margin-top: auto !important;
+}

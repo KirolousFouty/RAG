@@ -13,8 +13,8 @@ venv/
 .cache/
 models/
 
-# Chainlit
-.chainlit/
+# Chainlit — commit config.toml, ignore generated translations and uploads
+.chainlit/translations/
 .files/
 
 # DeepEval cache
