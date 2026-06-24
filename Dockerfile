@@ -24,5 +24,7 @@ COPY . .
 
 EXPOSE 8000
 
-# PORT is read from --env-file; defaults to 8000 if unset.
-CMD ["sh", "-c", "chainlit run app.py --host 0.0.0.0 --port ${PORT:-8000}"]
+# PORT is read from --env-file; defaults to 8000 if unset. The ${PORT%% *} trims any
+# trailing text (e.g. an inline comment that --env-file didn't strip) so a stray
+# comment in .env can't break startup.
+CMD ["sh", "-c", "P=\"${PORT:-8000}\"; chainlit run app.py --host 0.0.0.0 --port \"${P%% *}\""]
