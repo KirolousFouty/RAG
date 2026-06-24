@@ -23,7 +23,7 @@ and the app answers immediately on container start.
 
 ```bash
 # 1. Clone
-git clone <repo-url>
+git clone https://github.com/KirolousFouty/RAG
 cd RAG
 
 # 2. Fill in credentials
