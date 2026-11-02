@@ -11,6 +11,7 @@ metadata — that is the mandatory page/section citation, surfaced in the UI.
 """
 
 import logging
+import re
 
 import chainlit as cl
 
@@ -27,16 +28,32 @@ WELCOME = (
 )
 
 
-def _format_sources(sources: list[dict]) -> str:
+_RTL_CHARACTERS = re.compile(r"[\u0590-\u08FF]")
+_INLINE_PAGE_CITATION = re.compile(r"\(page\s+\d+\)")
+
+
+def _is_rtl(text: str) -> bool:
+    return bool(_RTL_CHARACTERS.search(text))
+
+
+def _format_answer_for_display(answer: str, rtl: bool) -> str:
+    if not rtl:
+        return answer
+    # Keep the English citation as one left-to-right unit inside Arabic/Hebrew text.
+    return _INLINE_PAGE_CITATION.sub(lambda match: f"\u2066{match.group(0)}\u2069", answer)
+
+
+def _format_sources(sources: list[dict], rtl: bool = False) -> str:
     lines = []
     for s in sources:
-        loc = f"page {s['page']}"
+        loc = f"الصفحة \u2066{s['page']}\u2069" if rtl else f"page {s['page']}"
         if s.get("section"):
             loc += f" — {s['section']}"
         if s.get("chapter"):
             loc += f" ({s['chapter']})"
         lines.append(f"- {loc}")
-    return "**Sources**\n" + "\n".join(lines)
+    heading = "**المصادر**" if rtl else "**Sources**"
+    return heading + "\n" + "\n".join(lines)
 
 
 @cl.on_chat_start
@@ -102,8 +119,10 @@ async def on_message(message: cl.Message):
         return
 
     answer = result["answer"]
+    rtl = _is_rtl(question)
+    answer = _format_answer_for_display(answer, rtl)
     if result["grounded"] and result["sources"]:
-        answer = f"{answer}\n\n{_format_sources(result['sources'])}"
+        answer = f"{answer}\n\n{_format_sources(result['sources'], rtl)}"
 
     await cl.Message(content=answer).send()
 
