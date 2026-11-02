@@ -98,6 +98,24 @@ class _FailoverChatModel:
             self._active, self._fallback = self._fallback, self._active
             return response
 
+    def stream(self, messages):
+        emitted = False
+        try:
+            for chunk in self._active.stream(messages):
+                emitted = True
+                yield chunk
+            return
+        except Exception:
+            # Restarting after partial output would duplicate text in the UI, so only
+            # fail over when the selected provider failed before its first token.
+            if emitted:
+                raise
+
+        for chunk in self._fallback.stream(messages):
+            yield chunk
+        self.active_name, self._fallback_name = self._fallback_name, self.active_name
+        self._active, self._fallback = self._fallback, self._active
+
 
 class _UnavailableChatModel:
     """Delay a missing-credential error until this provider is actually needed."""
@@ -215,6 +233,12 @@ class RagPipeline:
         )
         answer = self.llm.invoke(messages).content.strip()
 
+        return self._complete_answer(state, answer)
+
+    def _complete_answer(self, state: RagState, answer: str) -> RagState:
+        """Apply refusal handling, deterministic citations, and response localisation."""
+        docs = state["documents"]
+
         # If the model decided the excerpts don't answer the question, treat it as a
         # refusal and drop the citations — never cite sources for a non-answer. I match
         # on the prefix and normalise to the exact line, so an off-topic question that
@@ -241,6 +265,41 @@ class RagPipeline:
             "sources": sources,
             "grounded": True,
         }
+
+    def stream_answer(self, question: str, history: list[dict] | None = None):
+        """Yield generation tokens, followed by one final result with sources.
+
+        Retrieval and source construction remain buffered; only grounded answer text
+        is exposed incrementally. This prevents a Sources block from appearing until
+        the complete answer and its citations are known.
+        """
+        state: RagState = {"question": question, "history": history or []}
+        state.update(self._contextualize(state))
+        state.update(self._retrieve(state))
+        if not state["grounded"]:
+            yield {"final": self._refuse(state)}
+            return
+
+        docs = state["documents"]
+        context = format_context(docs)
+        user_turn = (
+            f"Here are excerpts from the iPhone User Guide:\n\n{context}\n\n"
+            f"Question: {state['standalone_question']}"
+        )
+        messages = (
+            [SystemMessage(SYSTEM_PROMPT)]
+            + _to_messages(state.get("history") or [])
+            + [HumanMessage(user_turn)]
+        )
+        parts = []
+        for chunk in self.llm.stream(messages):
+            content = chunk.content
+            if not isinstance(content, str):
+                continue
+            parts.append(content)
+            yield {"token": content}
+
+        yield {"final": self._complete_answer(state, "".join(parts).strip())}
 
     # --- wiring ---
     def _build(self):

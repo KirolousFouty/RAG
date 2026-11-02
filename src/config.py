@@ -20,6 +20,10 @@ def _int(name: str, default: int) -> int:
     return int(os.getenv(name, default))
 
 
+def _float(name: str, default: float) -> float:
+    return float(os.getenv(name, default))
+
+
 @dataclass(frozen=True)
 class Settings:
     # --- Secrets / connections ---
@@ -60,6 +64,8 @@ class Settings:
 
     # --- UI ---
     port: int = _int("PORT", 8000)
+    # Seconds between displayed characters while streaming a response.
+    stream_char_delay: float = _float("STREAM_CHAR_DELAY", 0.018)
 
 
 settings = Settings()

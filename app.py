@@ -12,6 +12,7 @@ metadata — that is the mandatory page/section citation, surfaced in the UI.
 
 import logging
 import re
+import asyncio
 
 import chainlit as cl
 
@@ -54,6 +55,18 @@ def _format_sources(sources: list[dict], rtl: bool = False) -> str:
         lines.append(f"- {loc}")
     heading = "**المصادر**" if rtl else "**Sources**"
     return heading + "\n" + "\n".join(lines)
+
+
+def _next_stream_event(stream):
+    """Return None instead of propagating StopIteration across a worker thread."""
+    return next(stream, None)
+
+
+async def _stream_smoothly(message: cl.Message, token: str):
+    """Turn provider-sized chunks into a readable typing effect."""
+    for character in token:
+        await message.stream_token(character)
+        await asyncio.sleep(settings.stream_char_delay)
 
 
 @cl.on_chat_start
@@ -110,7 +123,22 @@ async def on_message(message: cl.Message):
     # native animated "thinking" loader while the (synchronous) pipeline runs on a
     # thread. Sending an empty message instead would replace that with a static bubble.
     try:
-        result = await cl.make_async(pipeline.answer)(question, history)
+        stream = pipeline.stream_answer(question, history)
+        # Do the retrieval work before sending a message so Chainlit keeps showing
+        # its native animated loader until the first answer token is available.
+        event = await cl.make_async(_next_stream_event)(stream)
+        if event is None:
+            raise RuntimeError("Answer stream ended without a final result")
+        response = cl.Message(content="")
+        await response.send()
+        while event:
+            if token := event.get("token"):
+                await _stream_smoothly(response, token)
+            if result := event.get("final"):
+                break
+            event = await cl.make_async(_next_stream_event)(stream)
+        else:
+            raise RuntimeError("Answer stream ended without a final result")
     except Exception:
         logger.exception("RAG pipeline failed while answering a message")
         await cl.Message(
@@ -124,7 +152,8 @@ async def on_message(message: cl.Message):
     if result["grounded"] and result["sources"]:
         answer = f"{answer}\n\n{_format_sources(result['sources'], rtl)}"
 
-    await cl.Message(content=answer).send()
+    response.content = answer
+    await response.update()
 
     # Persist the turn so the next question has the conversation as context.
     history.append({"role": "user", "content": question})
