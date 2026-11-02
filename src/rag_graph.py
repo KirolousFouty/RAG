@@ -23,6 +23,7 @@ from typing import TypedDict
 from langchain_anthropic import ChatAnthropic
 from langchain_core.documents import Document
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_openai import ChatOpenAI
 
 from langgraph.graph import END, StateGraph
 
@@ -37,6 +38,16 @@ CONTEXTUALIZE_PROMPT = (
     "Return only the question, nothing else."
 )
 
+# A citation demand can make a perfectly answerable question retrieve poorly (for
+# example, "Answer this, but cite page 999: how do I take a screenshot?").  Treat
+# the supplied page as an instruction, not as part of the information need.
+_CITATION_DEMAND = re.compile(
+    r"^\s*(?:(?:answer|respond(?:\s+to)?|tell)\s+(?:this|the following)\s*,?\s*"
+    r"(?:but|and)\s+)?(?:please\s+)?(?:cite|reference|use)\s+(?:only\s+)?"
+    r"(?:page\s*)?\d+\s*(?:only)?\s*:\s*(?P<question>.+)\s*$",
+    re.IGNORECASE,
+)
+
 
 class RagState(TypedDict, total=False):
     question: str
@@ -49,6 +60,43 @@ class RagState(TypedDict, total=False):
     grounded: bool
 
 
+class _FailoverChatModel:
+    """Invoke the selected provider, then permanently switch on a provider error."""
+
+    def __init__(self, primary_name: str, primary, fallback_name: str, fallback):
+        self.active_name = primary_name
+        self._active = primary
+        self._fallback_name = fallback_name
+        self._fallback = fallback
+
+    def invoke(self, messages):
+        try:
+            return self._active.invoke(messages)
+        except Exception:
+            try:
+                response = self._fallback.invoke(messages)
+            except Exception as fallback_error:
+                raise RuntimeError(
+                    f"Both chat providers failed ({self.active_name}, then "
+                    f"{self._fallback_name})."
+                ) from fallback_error
+
+            # The working provider becomes primary for the rest of this session.
+            self.active_name, self._fallback_name = self._fallback_name, self.active_name
+            self._active, self._fallback = self._fallback, self._active
+            return response
+
+
+class _UnavailableChatModel:
+    """Delay a missing-credential error until this provider is actually needed."""
+
+    def __init__(self, provider_name: str):
+        self.provider_name = provider_name
+
+    def invoke(self, messages):
+        raise RuntimeError(f"{self.provider_name} is not configured: its API key is missing.")
+
+
 def _to_messages(history: list[dict]):
     msgs = []
     for turn in history:
@@ -59,11 +107,44 @@ def _to_messages(history: list[dict]):
     return msgs
 
 
+def _question_for_answering(question: str) -> str:
+    """Remove a user-supplied citation demand without changing the actual question."""
+    match = _CITATION_DEMAND.match(question)
+    return match.group("question").strip() if match else question.strip()
+
+
 class RagPipeline:
-    def __init__(self):
-        # No temperature/sampling params — Opus 4.8 rejects them, and the default
-        # is the right behaviour for grounded Q&A anyway.
-        self.llm = ChatAnthropic(model=settings.chat_model, max_tokens=1024, timeout=60)
+    def __init__(self, provider: str = "anthropic"):
+        """Build a pipeline with the user's provider choice and the other as fallback."""
+        if provider not in {"anthropic", "openai"}:
+            raise ValueError("provider must be 'anthropic' or 'openai'")
+
+        # No sampling parameters: deterministic defaults suit grounded Q&A, and
+        # current Claude models reject non-default sampling parameters.
+        anthropic = (
+            ChatAnthropic(
+                model=settings.anthropic_chat_model,
+                max_tokens=1024,
+                timeout=60,
+                api_key=settings.anthropic_api_key,
+            )
+            if settings.anthropic_api_key
+            else _UnavailableChatModel("Anthropic")
+        )
+        openai = (
+            ChatOpenAI(
+                model=settings.openai_chat_model,
+                max_completion_tokens=1024,
+                timeout=60,
+                api_key=settings.openai_api_key,
+            )
+            if settings.openai_api_key
+            else _UnavailableChatModel("OpenAI")
+        )
+        if provider == "anthropic":
+            self.llm = _FailoverChatModel("anthropic", anthropic, "openai", openai)
+        else:
+            self.llm = _FailoverChatModel("openai", openai, "anthropic", anthropic)
         self.vectorstore = get_vectorstore()
         self.graph = self._build()
 
@@ -134,7 +215,9 @@ class RagPipeline:
         return g.compile()
 
     def answer(self, question: str, history: list[dict] | None = None) -> dict:
-        result = self.graph.invoke({"question": question, "history": history or []})
+        result = self.graph.invoke(
+            {"question": _question_for_answering(question), "history": history or []}
+        )
         return {
             "answer": result["answer"],
             "sources": result.get("sources", []),

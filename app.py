@@ -10,10 +10,14 @@ Every grounded answer is followed by an explicit Sources block built from chunk
 metadata — that is the mandatory page/section citation, surfaced in the UI.
 """
 
+import logging
+
 import chainlit as cl
 
 from src.config import settings
 from src.rag_graph import RagPipeline
+
+logger = logging.getLogger(__name__)
 
 WELCOME = (
     "**iPhone User Guide assistant**\n\n"
@@ -37,24 +41,65 @@ def _format_sources(sources: list[dict]) -> str:
 
 @cl.on_chat_start
 async def on_chat_start():
-    # Build the pipeline once per session: this loads the embedding model and opens
-    # the Pinecone connection. Kept off the event loop so the UI shows immediately.
-    pipeline = await cl.make_async(RagPipeline)()
+    choice = await cl.AskActionMessage(
+        content="**Choose an AI provider to start this chat.**\n\n"
+        "If your choice is unavailable, the other provider is tried automatically.",
+        actions=[
+            cl.Action(
+                name="choose_provider",
+                payload={"provider": "anthropic"},
+                label="Anthropic (Claude)",
+            ),
+            cl.Action(
+                name="choose_provider",
+                payload={"provider": "openai"},
+                label="OpenAI",
+            ),
+        ],
+        timeout=300,
+    ).send()
+    if choice is None:
+        await cl.Message(content="No provider was selected. Please start a new chat and choose one.").send()
+        return
+
+    provider = choice["payload"]["provider"]
+    try:
+        # Build the pipeline once per session. This loads the embedding model and
+        # opens the Pinecone connection off the event loop.
+        pipeline = await cl.make_async(RagPipeline)(provider)
+    except Exception:
+        logger.exception("Failed to initialise the RAG pipeline")
+        await cl.Message(
+            content="I couldn't start the chatbot. Check the server logs and API configuration, then start a new chat."
+        ).send()
+        return
+
     cl.user_session.set("pipeline", pipeline)
     cl.user_session.set("history", [])
-    await cl.Message(content=WELCOME).send()
+    provider_label = "Anthropic (Claude)" if provider == "anthropic" else "OpenAI"
+    await cl.Message(content=f"{WELCOME}\n\n**Selected provider:** {provider_label}").send()
 
 
 @cl.on_message
 async def on_message(message: cl.Message):
     pipeline: RagPipeline = cl.user_session.get("pipeline")
+    if pipeline is None:
+        await cl.Message(content="Choose a provider to start the chat before sending a question.").send()
+        return
     history: list[dict] = cl.user_session.get("history")
     question = message.content
 
     # No placeholder message here: leaving the turn pending lets Chainlit show its
     # native animated "thinking" loader while the (synchronous) pipeline runs on a
     # thread. Sending an empty message instead would replace that with a static bubble.
-    result = await cl.make_async(pipeline.answer)(question, history)
+    try:
+        result = await cl.make_async(pipeline.answer)(question, history)
+    except Exception:
+        logger.exception("RAG pipeline failed while answering a message")
+        await cl.Message(
+            content="I couldn't complete that request because both AI providers failed. Please try again shortly."
+        ).send()
+        return
 
     answer = result["answer"]
     if result["grounded"] and result["sources"]:

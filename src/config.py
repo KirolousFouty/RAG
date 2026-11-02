@@ -24,6 +24,7 @@ def _int(name: str, default: int) -> int:
 class Settings:
     # --- Secrets / connections ---
     anthropic_api_key: str = os.getenv("ANTHROPIC_API_KEY", "")
+    openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
     pinecone_api_key: str = os.getenv("PINECONE_API_KEY", "")
 
     # --- Vector store ---
@@ -38,7 +39,10 @@ class Settings:
     embedding_dim: int = _int("EMBEDDING_DIM", 384)
     # Opus 4.8 follows the "only answer from the context" instruction the most
     # reliably of the models I tried, which is the whole game for strict grounding.
-    chat_model: str = os.getenv("CHAT_MODEL", "claude-opus-4-8")
+    anthropic_chat_model: str = os.getenv(
+        "ANTHROPIC_CHAT_MODEL", os.getenv("CHAT_MODEL", "claude-opus-4-8")
+    )
+    openai_chat_model: str = os.getenv("OPENAI_CHAT_MODEL", "gpt-6-luna")
 
     # --- Ingestion ---
     pdf_path: str = os.getenv("PDF_PATH", "iPhone User Guide 1.pdf")

@@ -16,7 +16,7 @@ from src.config import settings
 
 class ClaudeJudge(DeepEvalBaseLLM):
     def __init__(self, model: str | None = None):
-        self.model = model or settings.chat_model
+        self.model = model or settings.anthropic_chat_model
         self._chat = ChatAnthropic(model=self.model, max_tokens=2048, timeout=120)
 
     def load_model(self):
