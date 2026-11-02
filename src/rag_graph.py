@@ -18,6 +18,8 @@ Multi-turn memory has two parts:
 from __future__ import annotations
 
 import re
+import logging
+import time
 from typing import TypedDict
 
 from langchain_anthropic import ChatAnthropic
@@ -30,6 +32,8 @@ from langgraph.graph import END, StateGraph
 from .config import settings
 from .prompts import NO_CONTEXT_REPLY, SYSTEM_PROMPT, format_context
 from .vectorstore import get_vectorstore
+
+logger = logging.getLogger(__name__)
 
 CONTEXTUALIZE_PROMPT = (
     "Given the conversation so far and the user's latest message, produce a single "
@@ -61,6 +65,7 @@ _PAGE_REQUEST = re.compile(r"\bpage\s+(\d+)\b", re.IGNORECASE)
 
 
 class RagState(TypedDict, total=False):
+    trace_id: str
     question: str
     history: list[dict]          # [{"role": "user"|"assistant", "content": str}]
     standalone_question: str
@@ -80,18 +85,66 @@ class _FailoverChatModel:
         self._active = primary
         self._fallback_name = fallback_name
         self._fallback = fallback
+        self.trace_id = "-"
+        self.stage = "llm"
+
+    def set_trace(self, trace_id: str):
+        self.trace_id = trace_id
+
+    def set_stage(self, stage: str):
+        self.stage = stage
+
+    @staticmethod
+    def _request_id(response) -> str | None:
+        metadata = getattr(response, "response_metadata", {}) or {}
+        headers = metadata.get("headers", {}) or {}
+        return metadata.get("request_id") or metadata.get("id") or headers.get("x-request-id")
+
+    def _log_success(self, provider: str, started: float, response):
+        logger.info(
+            "llm_success trace_id=%s stage=%s provider=%s latency_ms=%d provider_request_id=%s",
+            self.trace_id,
+            self.stage,
+            provider,
+            (time.perf_counter() - started) * 1000,
+            self._request_id(response) or "-",
+        )
+
+    def _log_failure(self, provider: str, started: float, error: Exception):
+        logger.warning(
+            "llm_failure trace_id=%s stage=%s provider=%s latency_ms=%d error_type=%s reason=%s",
+            self.trace_id,
+            self.stage,
+            provider,
+            (time.perf_counter() - started) * 1000,
+            type(error).__name__,
+            str(error)[:240],
+        )
 
     def invoke(self, messages):
+        provider = self.active_name
+        started = time.perf_counter()
         try:
-            return self._active.invoke(messages)
-        except Exception:
+            response = self._active.invoke(messages)
+            self._log_success(provider, started, response)
+            return response
+        except Exception as primary_error:
+            self._log_failure(provider, started, primary_error)
+            logger.info(
+                "llm_failover trace_id=%s from_provider=%s to_provider=%s",
+                self.trace_id, provider, self._fallback_name,
+            )
+            fallback_provider = self._fallback_name
+            fallback_started = time.perf_counter()
             try:
                 response = self._fallback.invoke(messages)
             except Exception as fallback_error:
+                self._log_failure(fallback_provider, fallback_started, fallback_error)
                 raise RuntimeError(
-                    f"Both chat providers failed ({self.active_name}, then "
-                    f"{self._fallback_name})."
+                    f"Both chat providers failed ({provider}, then {fallback_provider})."
                 ) from fallback_error
+
+            self._log_success(fallback_provider, fallback_started, response)
 
             # The working provider becomes primary for the rest of this session.
             self.active_name, self._fallback_name = self._fallback_name, self.active_name
@@ -100,19 +153,34 @@ class _FailoverChatModel:
 
     def stream(self, messages):
         emitted = False
+        provider = self.active_name
+        started = time.perf_counter()
         try:
             for chunk in self._active.stream(messages):
                 emitted = True
                 yield chunk
+            self._log_success(provider, started, chunk if emitted else None)
             return
-        except Exception:
+        except Exception as primary_error:
+            self._log_failure(provider, started, primary_error)
             # Restarting after partial output would duplicate text in the UI, so only
             # fail over when the selected provider failed before its first token.
             if emitted:
                 raise
 
-        for chunk in self._fallback.stream(messages):
-            yield chunk
+        fallback_provider = self._fallback_name
+        logger.info(
+            "llm_failover trace_id=%s from_provider=%s to_provider=%s",
+            self.trace_id, provider, fallback_provider,
+        )
+        fallback_started = time.perf_counter()
+        try:
+            for chunk in self._fallback.stream(messages):
+                yield chunk
+        except Exception as fallback_error:
+            self._log_failure(fallback_provider, fallback_started, fallback_error)
+            raise
+        self._log_success(fallback_provider, fallback_started, chunk if 'chunk' in locals() else None)
         self.active_name, self._fallback_name = self._fallback_name, self.active_name
         self._active, self._fallback = self._fallback, self._active
 
@@ -177,9 +245,14 @@ class RagPipeline:
             self.llm = _FailoverChatModel("openai", openai, "anthropic", anthropic)
         self.vectorstore = get_vectorstore()
         self.graph = self._build()
+        logger.info(
+            "pipeline_initialised selected_provider=%s fallback_provider=%s",
+            self.llm.active_name, self.llm._fallback_name,
+        )
 
     # --- nodes ---
     def _contextualize(self, state: RagState) -> RagState:
+        started = time.perf_counter()
         history = state.get("history") or []
         question = state["question"]
         messages = (
@@ -187,10 +260,16 @@ class RagPipeline:
             + _to_messages(history)
             + [HumanMessage(question)]
         )
+        self.llm.set_stage("contextualize")
         rewritten = self.llm.invoke(messages).content.strip()
+        logger.info(
+            "stage_complete trace_id=%s stage=contextualize latency_ms=%d",
+            state.get("trace_id", "-"), (time.perf_counter() - started) * 1000,
+        )
         return {"standalone_question": rewritten or _question_for_answering(question)}
 
     def _retrieve(self, state: RagState) -> RagState:
+        started = time.perf_counter()
         query = state.get("standalone_question") or state["question"]
         page_match = _PAGE_REQUEST.search(query)
         requested_page = int(page_match.group(1)) if page_match else None
@@ -208,6 +287,12 @@ class RagPipeline:
         # score is low: the requested page is explicitly present in the guide.
         grounded = bool(results) and (
             requested_page is not None or top_score >= settings.min_relevance_score
+        )
+        logger.info(
+            "retrieval_complete trace_id=%s latency_ms=%d result_count=%d top_score=%.4f "
+            "requested_page=%s grounded=%s",
+            state.get("trace_id", "-"), (time.perf_counter() - started) * 1000,
+            len(results), top_score, requested_page if requested_page is not None else "-", grounded,
         )
         return {
             "documents": documents,
@@ -231,6 +316,7 @@ class RagPipeline:
             + _to_messages(state.get("history") or [])
             + [HumanMessage(user_turn)]
         )
+        self.llm.set_stage("generate")
         answer = self.llm.invoke(messages).content.strip()
 
         return self._complete_answer(state, answer)
@@ -247,6 +333,7 @@ class RagPipeline:
             return {"answer": NO_CONTEXT_REPLY, "sources": [], "grounded": False}
         sources = _sources(docs, answer)
         try:
+            self.llm.set_stage("localize")
             localized_answer = self.llm.invoke(
                 [
                     SystemMessage(TRANSLATE_ANSWER_PROMPT),
@@ -266,17 +353,25 @@ class RagPipeline:
             "grounded": True,
         }
 
-    def stream_answer(self, question: str, history: list[dict] | None = None):
+    def stream_answer(
+        self, question: str, history: list[dict] | None = None, trace_id: str = "-"
+    ):
         """Yield generation tokens, followed by one final result with sources.
 
         Retrieval and source construction remain buffered; only grounded answer text
         is exposed incrementally. This prevents a Sources block from appearing until
         the complete answer and its citations are known.
         """
-        state: RagState = {"question": question, "history": history or []}
+        self.llm.set_trace(trace_id)
+        logger.info(
+            "request_started trace_id=%s selected_provider=%s fallback_provider=%s",
+            trace_id, self.llm.active_name, self.llm._fallback_name,
+        )
+        state: RagState = {"question": question, "history": history or [], "trace_id": trace_id}
         state.update(self._contextualize(state))
         state.update(self._retrieve(state))
         if not state["grounded"]:
+            logger.info("request_refused trace_id=%s reason=low_relevance", trace_id)
             yield {"final": self._refuse(state)}
             return
 
@@ -292,6 +387,7 @@ class RagPipeline:
             + [HumanMessage(user_turn)]
         )
         parts = []
+        self.llm.set_stage("generate_stream")
         for chunk in self.llm.stream(messages):
             content = chunk.content
             if not isinstance(content, str):
@@ -299,7 +395,12 @@ class RagPipeline:
             parts.append(content)
             yield {"token": content}
 
-        yield {"final": self._complete_answer(state, "".join(parts).strip())}
+        result = self._complete_answer(state, "".join(parts).strip())
+        logger.info(
+            "request_completed trace_id=%s grounded=%s sources=%d active_provider=%s",
+            trace_id, result["grounded"], len(result.get("sources", [])), self.llm.active_name,
+        )
+        yield {"final": result}
 
     # --- wiring ---
     def _build(self):

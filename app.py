@@ -13,6 +13,7 @@ metadata — that is the mandatory page/section citation, surfaced in the UI.
 import logging
 import re
 import asyncio
+import uuid
 
 import chainlit as cl
 
@@ -118,12 +119,14 @@ async def on_message(message: cl.Message):
         return
     history: list[dict] = cl.user_session.get("history")
     question = message.content
+    trace_id = uuid.uuid4().hex[:12]
+    logger.info("chat_request_received trace_id=%s history_turns=%d", trace_id, len(history) // 2)
 
     # No placeholder message here: leaving the turn pending lets Chainlit show its
     # native animated "thinking" loader while the (synchronous) pipeline runs on a
     # thread. Sending an empty message instead would replace that with a static bubble.
     try:
-        stream = pipeline.stream_answer(question, history)
+        stream = pipeline.stream_answer(question, history, trace_id)
         # Do the retrieval work before sending a message so Chainlit keeps showing
         # its native animated loader until the first answer token is available.
         event = await cl.make_async(_next_stream_event)(stream)
@@ -140,7 +143,7 @@ async def on_message(message: cl.Message):
         else:
             raise RuntimeError("Answer stream ended without a final result")
     except Exception:
-        logger.exception("RAG pipeline failed while answering a message")
+        logger.exception("chat_request_failed trace_id=%s", trace_id)
         await cl.Message(
             content="I couldn't complete that request because both AI providers failed. Please try again shortly."
         ).send()
