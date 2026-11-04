@@ -715,7 +715,14 @@ def _sources(docs: list[Document], answer: str = "") -> list[dict]:
     retrieved chunk — including the tangential ones top-k always drags along. If the
     model cited nothing, I fall back to all retrieved pages.
     """
-    cited = {int(n) for n in re.findall(r"page\s+(\d+)", answer)}
+    # Models use both ``(page 38)`` and ``(pages 10, 38)``.  Parse every number
+    # in either form so the deterministic Sources block reflects the pages the
+    # answer actually cites, rather than falling back to every retrieved chunk.
+    cited = {
+        int(number)
+        for group in re.findall(r"\bpages?\s+([\d\s,;and]+)", answer, re.IGNORECASE)
+        for number in re.findall(r"\d+", group)
+    }
 
     def page(meta) -> int:
         try:
