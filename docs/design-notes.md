@@ -24,7 +24,7 @@ stands on its own; this page is just the map.
                                                           grounded? ──no──► "not in the guide"
                                                                    │yes
                                                                    ▼
-                                                      generate (Claude Opus 4.8) ─► answer + Sources
+                                                      generate (GPT-6 Luna) ─► answer + Sources
 ```
 
 The reproducible evidence behind the choices lives in `eval/` — `questions.yaml` is the

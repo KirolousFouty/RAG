@@ -25,9 +25,9 @@ still wander off the context or miss the question. **Rana suggested in the inter
 that I use DeepEval to evaluate the LLM side**, which was a good call: it gives me
 answer-level metrics with an LLM judge instead of me eyeballing outputs.
 
-DeepEval normally judges with OpenAI; since I use Anthropic everywhere else, I wrapped
-the same Claude chat model as the judge (`eval/claude_judge.py`) so there's one
-provider and one key. I run three metrics over a handful of in-guide questions, scoring
+DeepEval uses the configured OpenAI chat model as the judge (`eval/openai_judge.py`), so the
+application and evaluation share one provider and one key. I run three metrics over a handful
+of in-guide questions, scoring
 the real answers against the context actually retrieved from Pinecone:
 
 - **Faithfulness** — is every claim in the answer supported by the retrieved context?
@@ -38,7 +38,7 @@ the real answers against the context actually retrieved from Pinecone:
 
 ### Results
 
-Averaged over the four questions (Claude Opus 4.8 as judge):
+Averaged over the four questions (OpenAI model as judge):
 
 | Metric                | Average | Reading |
 | --------------------- | :-----: | ------- |

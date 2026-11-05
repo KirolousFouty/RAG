@@ -3,7 +3,7 @@
 Rana suggested in the interview that I use DeepEval to evaluate the LLM side of the
 system, so I added this alongside the retrieval benchmark in run_eval.py. Where
 run_eval.py measures *retrieval* (did the right page come back?), this measures the
-*generated answer* against the retrieved context with Claude as the judge:
+*generated answer* against the retrieved context with OpenAI as the judge:
 
   * Faithfulness        — is every claim in the answer supported by the context?
                           (this is the groundedness / anti-hallucination check)
@@ -37,7 +37,7 @@ from deepeval.metrics import (  # noqa: E402
 )
 from deepeval.test_case import LLMTestCase  # noqa: E402
 
-from eval.claude_judge import ClaudeJudge  # noqa: E402
+from eval.openai_judge import OpenAIJudge  # noqa: E402
 from src.rag_graph import RagPipeline  # noqa: E402
 
 # A few in-guide questions; the grounding/refusal behaviour itself is covered by the
@@ -51,7 +51,7 @@ QUESTIONS = [
 
 
 def main():
-    judge = ClaudeJudge()
+    judge = OpenAIJudge()
     pipeline = RagPipeline()
 
     metrics = [

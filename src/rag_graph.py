@@ -25,7 +25,6 @@ import hashlib
 from math import ceil
 from typing import TypedDict
 
-from langchain_anthropic import ChatAnthropic
 from langchain_core.documents import Document
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
@@ -286,22 +285,68 @@ def _diagnostic(state: RagState | dict, stage: str, **fields) -> None:
     logger.info("rag_diagnostic %s", json.dumps(record, ensure_ascii=False, sort_keys=True))
 
 
-class _FailoverChatModel:
-    """Invoke the selected provider, then permanently switch on a provider error."""
+class _OpenAIChatModel:
+    """OpenAI adapter with structured-output handling and request diagnostics."""
 
     # These stages all require a top-level JSON object. The splitter intentionally
     # remains an array because its parser and fallback contract are array-based.
-    # OpenAI JSON mode prevents provider-format drift from being mistaken for a
-    # missing-PDF-evidence refusal; Anthropic retains its existing prompt contract.
+    # JSON mode prevents provider-format drift from being mistaken for a
+    # missing-PDF-evidence refusal.
     _OPENAI_JSON_OBJECT_STAGES = frozenset({
         "contextualize", "generate_claims", "validate_claims", "translate_claims",
     })
 
-    def __init__(self, primary_name: str, primary, fallback_name: str, fallback):
-        self.active_name = primary_name
-        self._active = primary
-        self._fallback_name = fallback_name
-        self._fallback = fallback
+    # JSON object mode only guarantees valid JSON. The answer step needs a stronger
+    # contract: every answer must contain evidence-linked claims, while a refusal is
+    # represented explicitly so it is never mistaken for a malformed answer.
+    _CLAIMS_RESPONSE_FORMAT = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "grounded_claims",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "claims": {
+                        "anyOf": [
+                            {
+                                "type": "array",
+                                "minItems": 1,
+                                "maxItems": 8,
+                                "items": {
+                                    "type": "object",
+                                    "additionalProperties": False,
+                                    "properties": {
+                                        "text": {"type": "string", "minLength": 1},
+                                        "evidence_ids": {
+                                            "type": "array",
+                                            "minItems": 1,
+                                            "items": {"type": "integer", "minimum": 1},
+                                        },
+                                    },
+                                    "required": ["text", "evidence_ids"],
+                                },
+                            },
+                            {"type": "null"},
+                        ],
+                    },
+                    "refusal": {
+                        "anyOf": [
+                            {"type": "boolean", "enum": [True]},
+                            {"type": "null"},
+                        ],
+                    },
+                },
+                "required": ["claims", "refusal"],
+            },
+        },
+    }
+
+    active_name = "openai"
+
+    def __init__(self, model):
+        self._model = model
         self.trace_id = "-"
         self.stage = "llm"
 
@@ -317,107 +362,56 @@ class _FailoverChatModel:
         headers = metadata.get("headers", {}) or {}
         return metadata.get("request_id") or metadata.get("id") or headers.get("x-request-id")
 
-    def _log_success(self, provider: str, started: float, response):
+    def _log_success(self, started: float, response):
         logger.info(
             "llm_success trace_id=%s stage=%s provider=%s latency_ms=%d provider_request_id=%s",
             self.trace_id,
             self.stage,
-            provider,
+            "openai",
             (time.perf_counter() - started) * 1000,
             self._request_id(response) or "-",
         )
 
-    def _log_failure(self, provider: str, started: float, error: Exception):
+    def _log_failure(self, started: float, error: Exception):
         logger.warning(
             "llm_failure trace_id=%s stage=%s provider=%s latency_ms=%d error_type=%s reason=%s",
             self.trace_id,
             self.stage,
-            provider,
+            "openai",
             (time.perf_counter() - started) * 1000,
             type(error).__name__,
             str(error)[:240],
         )
 
-    def _invoke_provider(self, provider: str, model, messages):
-        if provider == "openai" and self.stage in self._OPENAI_JSON_OBJECT_STAGES:
+    def _invoke(self, messages):
+        if self.stage == "generate_claims":
+            return self._model.bind(response_format=self._CLAIMS_RESPONSE_FORMAT).invoke(messages)
+        if self.stage in self._OPENAI_JSON_OBJECT_STAGES:
             # Keep an AIMessage return shape so the existing strict parser and
-            # failover path remain unchanged. JSON mode enforces syntax, while our
+            # parsing path remain unchanged. JSON mode enforces syntax, while our
             # independent code validation still enforces schema and grounding.
-            return model.bind(response_format={"type": "json_object"}).invoke(messages)
-        return model.invoke(messages)
+            return self._model.bind(response_format={"type": "json_object"}).invoke(messages)
+        return self._model.invoke(messages)
 
     def invoke(self, messages):
-        provider = self.active_name
         started = time.perf_counter()
         try:
-            response = self._invoke_provider(provider, self._active, messages)
-            self._log_success(provider, started, response)
+            response = self._invoke(messages)
+            self._log_success(started, response)
             return response
-        except Exception as primary_error:
-            self._log_failure(provider, started, primary_error)
-            logger.info(
-                "llm_failover trace_id=%s from_provider=%s to_provider=%s",
-                self.trace_id, provider, self._fallback_name,
-            )
-            fallback_provider = self._fallback_name
-            fallback_started = time.perf_counter()
-            try:
-                response = self._invoke_provider(fallback_provider, self._fallback, messages)
-            except Exception as fallback_error:
-                self._log_failure(fallback_provider, fallback_started, fallback_error)
-                raise RuntimeError(
-                    f"Both chat providers failed ({provider}, then {fallback_provider})."
-                ) from fallback_error
-
-            self._log_success(fallback_provider, fallback_started, response)
-
-            # The working provider becomes primary for the rest of this session.
-            self.active_name, self._fallback_name = self._fallback_name, self.active_name
-            self._active, self._fallback = self._fallback, self._active
-            return response
+        except Exception as error:
+            self._log_failure(started, error)
+            raise
 
     def stream(self, messages):
-        emitted = False
-        provider = self.active_name
         started = time.perf_counter()
         try:
-            for chunk in self._active.stream(messages):
-                emitted = True
+            for chunk in self._model.stream(messages):
                 yield chunk
-            self._log_success(provider, started, chunk if emitted else None)
-            return
-        except Exception as primary_error:
-            self._log_failure(provider, started, primary_error)
-            # Restarting after partial output would duplicate text in the UI, so only
-            # fail over when the selected provider failed before its first token.
-            if emitted:
-                raise
-
-        fallback_provider = self._fallback_name
-        logger.info(
-            "llm_failover trace_id=%s from_provider=%s to_provider=%s",
-            self.trace_id, provider, fallback_provider,
-        )
-        fallback_started = time.perf_counter()
-        try:
-            for chunk in self._fallback.stream(messages):
-                yield chunk
-        except Exception as fallback_error:
-            self._log_failure(fallback_provider, fallback_started, fallback_error)
+            self._log_success(started, chunk if "chunk" in locals() else None)
+        except Exception as error:
+            self._log_failure(started, error)
             raise
-        self._log_success(fallback_provider, fallback_started, chunk if 'chunk' in locals() else None)
-        self.active_name, self._fallback_name = self._fallback_name, self.active_name
-        self._active, self._fallback = self._fallback, self._active
-
-
-class _UnavailableChatModel:
-    """Delay a missing-credential error until this provider is actually needed."""
-
-    def __init__(self, provider_name: str):
-        self.provider_name = provider_name
-
-    def invoke(self, messages):
-        raise RuntimeError(f"{self.provider_name} is not configured: its API key is missing.")
 
 
 def _to_messages(history: list[dict]):
@@ -753,42 +747,27 @@ def _guide_terminology_query(question: str) -> str:
 
 
 class RagPipeline:
-    def __init__(self, provider: str = "anthropic"):
-        """Build a pipeline with the user's provider choice and the other as fallback."""
-        if provider not in {"anthropic", "openai"}:
-            raise ValueError("provider must be 'anthropic' or 'openai'")
+    def __init__(self):
+        """Build the pipeline around the configured OpenAI chat model."""
+        if not settings.openai_api_key:
+            raise RuntimeError("OpenAI is not configured: OPENAI_API_KEY is missing.")
 
-        # No sampling parameters: deterministic defaults suit grounded Q&A, and
-        # current Claude models reject non-default sampling parameters.
-        anthropic = (
-            ChatAnthropic(
-                model=settings.anthropic_chat_model,
-                max_tokens=1024,
-                timeout=60,
-                api_key=settings.anthropic_api_key,
-            )
-            if settings.anthropic_api_key
-            else _UnavailableChatModel("Anthropic")
-        )
-        openai = (
+        # No sampling parameters: provider defaults suit grounded Q&A and preserve
+        # compatibility with models that only accept their default temperature.
+        self.llm = _OpenAIChatModel(
             ChatOpenAI(
                 model=settings.openai_chat_model,
-                max_completion_tokens=1024,
+                max_completion_tokens=settings.openai_max_completion_tokens,
+                reasoning_effort=settings.openai_reasoning_effort,
                 timeout=60,
                 api_key=settings.openai_api_key,
             )
-            if settings.openai_api_key
-            else _UnavailableChatModel("OpenAI")
         )
-        if provider == "anthropic":
-            self.llm = _FailoverChatModel("anthropic", anthropic, "openai", openai)
-        else:
-            self.llm = _FailoverChatModel("openai", openai, "anthropic", anthropic)
         self.vectorstore = get_vectorstore()
         self.graph = self._build()
         logger.info(
-            "pipeline_initialised selected_provider=%s fallback_provider=%s",
-            self.llm.active_name, self.llm._fallback_name,
+            "pipeline_initialised provider=%s",
+            self.llm.active_name,
         )
 
     # --- nodes ---
@@ -894,7 +873,24 @@ class RagPipeline:
 
     def _contextualize_with_retry(self, state: RagState) -> RagState:
         """Retry an otherwise user-visible clarification up to the configured bound."""
-        result = self._contextualize(state)
+        history = _bounded_history(state.get("history"))
+        try:
+            result = self._contextualize(state)
+        except Exception as error:
+            # A truncated or temporarily unavailable contextualizer must not abort
+            # the entire chat. The deterministic fallback retains the user's actual
+            # request and is intentionally more conservative about ambiguity.
+            logger.warning(
+                "contextualize_failed_falling_back trace_id=%s error_type=%s",
+                state.get("trace_id", "-"), type(error).__name__,
+            )
+            _diagnostic(
+                state,
+                "contextualize",
+                status="failed_fallback_to_question",
+                error_type=type(error).__name__,
+            )
+            return _parse_contextualization("", state["question"], history)
         for attempt in range(1, MAX_REFUSAL_RETRIES + 1):
             if not result.get("needs_clarification"):
                 break
@@ -939,6 +935,8 @@ class RagPipeline:
         for attempt in range(1, MAX_REFUSAL_RETRIES + 1):
             if result["grounded"]:
                 return result, ""
+            if substate.get("refusal_reason") == "model_refusal":
+                return result, "model_refusal"
             # A generation/validation retry always reuses the same evidence.
             _diagnostic(state, "subrequest_retry", attempt=attempt, reason="claim_validation_failed")
             result = self._generate(substate)
@@ -1129,13 +1127,23 @@ class RagPipeline:
         History may help make a follow-up searchable, but it is never document evidence.
         The standalone question and the fresh excerpts are the entire factual input.
         """
-        return [
+        messages = [
             SystemMessage(SYSTEM_PROMPT),
             HumanMessage(
                 f"{format_context(state['documents'])}\n\n"
                 f"<question>{state['standalone_question']}</question>"
             ),
         ]
+        if state.get("claim_generation_attempt", 0) > 1:
+            messages.append(
+                SystemMessage(
+                    "Retry: your prior response could not be safely rendered. Re-read the supplied "
+                    "excerpts and return one to eight non-empty, directly supported claims. Every "
+                    "evidence_ids value must be an integer from 1 through the number of supplied "
+                    "excerpts. Use the explicit refusal object only when no excerpt supports an answer."
+                )
+            )
+        return messages
 
     def _validated_claims(self, state: RagState) -> list[dict] | None:
         """Generate claims then independently check their asserted evidence links.
@@ -1145,10 +1153,15 @@ class RagPipeline:
         unsupported answer.
         """
         started = time.perf_counter()
+        state["claim_generation_attempt"] = state.get("claim_generation_attempt", 0) + 1
         self.llm.set_stage("generate_claims")
         payload = _json_object(self.llm.invoke(self._claim_messages(state)).content)
         if payload is None:
             _diagnostic(state, "claim_generation", status="invalid_json")
+            return None
+        if payload.get("refusal") is True:
+            _diagnostic(state, "claim_generation", status="explicit_refusal")
+            state["refusal_reason"] = "model_refusal"
             return None
         raw_claims = payload.get("claims")
         if not isinstance(raw_claims, list):
@@ -1184,6 +1197,7 @@ class RagPipeline:
 
         _diagnostic(
             state, "claim_generation", status="accepted", claim_count=len(claims),
+            attempt=state["claim_generation_attempt"],
             evidence_id_counts=[len(claim["evidence_ids"]) for claim in claims],
         )
 
@@ -1306,7 +1320,7 @@ class RagPipeline:
             claims = self._translate_claims(state, claims, answer_language)
         rendered = self._render_claims(claims, state["documents"]) if claims else None
         if not rendered:
-            state["refusal_reason"] = "claim_validation_failed"
+            state["refusal_reason"] = state.get("refusal_reason") or "claim_validation_failed"
             return self._refuse(state)
         answer, sources = rendered
         return {
@@ -1345,8 +1359,8 @@ class RagPipeline:
         """
         self.llm.set_trace(trace_id)
         logger.info(
-            "request_started trace_id=%s selected_provider=%s fallback_provider=%s",
-            trace_id, self.llm.active_name, self.llm._fallback_name,
+            "request_started trace_id=%s provider=%s",
+            trace_id, self.llm.active_name,
         )
         sanitized_question = _sanitize_question(question)
         _diagnostic({"trace_id": trace_id}, "input", status="accepted", char_count=len(question))
@@ -1414,7 +1428,7 @@ class RagPipeline:
             refusal_categories=[item.get("refusal_reason", "") for item in results if not item.get("grounded")],
         )
         logger.info(
-            "request_completed trace_id=%s subrequest_count=%d grounded=%s sources=%d active_provider=%s",
+            "request_completed trace_id=%s subrequest_count=%d grounded=%s sources=%d provider=%s",
             trace_id, len(results), result["grounded"], len(result.get("sources", [])), self.llm.active_name,
         )
         yield {"token": result["answer"]}

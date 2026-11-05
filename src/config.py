@@ -31,7 +31,6 @@ def _bool(name: str, default: bool = False) -> bool:
 @dataclass(frozen=True)
 class Settings:
     # --- Secrets / connections ---
-    anthropic_api_key: str = os.getenv("ANTHROPIC_API_KEY", "")
     openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
     pinecone_api_key: str = os.getenv("PINECONE_API_KEY", "")
 
@@ -45,12 +44,14 @@ class Settings:
     # which is also what let me benchmark retrieval offline (see docs/embeddings.md).
     embedding_model: str = os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
     embedding_dim: int = _int("EMBEDDING_DIM", 384)
-    # Opus 4.8 follows the "only answer from the context" instruction the most
-    # reliably of the models I tried, which is the whole game for strict grounding.
-    anthropic_chat_model: str = os.getenv(
-        "ANTHROPIC_CHAT_MODEL", os.getenv("CHAT_MODEL", "claude-opus-4-8")
-    )
     openai_chat_model: str = os.getenv("OPENAI_CHAT_MODEL", "gpt-6-luna")
+    # Completion budgets include non-visible reasoning tokens. Leave enough room for
+    # structured responses instead of allowing a reasoning model to exhaust its
+    # budget before emitting JSON.
+    openai_max_completion_tokens: int = _int("OPENAI_MAX_COMPLETION_TOKENS", 2048)
+    # Contextualization, claim extraction, and evidence checks are bounded routing
+    # tasks, so low reasoning effort keeps latency and token use predictable.
+    openai_reasoning_effort: str = os.getenv("OPENAI_REASONING_EFFORT", "low")
 
     # --- Ingestion ---
     pdf_path: str = os.getenv("PDF_PATH", "iPhone User Guide 1.pdf")
@@ -86,8 +87,15 @@ class Settings:
                 "EMBEDDING_MODEL and EMBEDDING_DIM must match the pre-ingested "
                 "BAAI/bge-small-en-v1.5 / 384-dimension Pinecone index."
             )
-        if self.max_question_chars < 1 or self.max_history_messages < 1:
-            raise ValueError("MAX_QUESTION_CHARS and MAX_HISTORY_MESSAGES must be positive.")
+        if (
+            self.max_question_chars < 1
+            or self.max_history_messages < 1
+            or self.openai_max_completion_tokens < 1
+        ):
+            raise ValueError(
+                "MAX_QUESTION_CHARS, MAX_HISTORY_MESSAGES, and "
+                "OPENAI_MAX_COMPLETION_TOKENS must be positive."
+            )
 
 
 settings = Settings()

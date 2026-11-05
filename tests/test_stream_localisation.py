@@ -5,7 +5,6 @@ from src.rag_graph import RagPipeline
 
 class _StreamingModel:
     active_name = "test"
-    _fallback_name = "fallback"
 
     def set_trace(self, _trace_id):
         pass

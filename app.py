@@ -79,32 +79,10 @@ async def _stream_smoothly(message: cl.Message, token: str):
 
 @cl.on_chat_start
 async def on_chat_start():
-    choice = await cl.AskActionMessage(
-        content="**Choose an AI provider to start this chat.**\n\n"
-        "If your choice is unavailable, the other provider is tried automatically.",
-        actions=[
-            cl.Action(
-                name="choose_provider",
-                payload={"provider": "anthropic"},
-                label="Anthropic (Claude)",
-            ),
-            cl.Action(
-                name="choose_provider",
-                payload={"provider": "openai"},
-                label="OpenAI",
-            ),
-        ],
-        timeout=300,
-    ).send()
-    if choice is None:
-        await cl.Message(content="No provider was selected. Please start a new chat and choose one.").send()
-        return
-
-    provider = choice["payload"]["provider"]
     try:
         # Build the pipeline once per session. This loads the embedding model and
         # opens the Pinecone connection off the event loop.
-        pipeline = await cl.make_async(RagPipeline)(provider)
+        pipeline = await cl.make_async(RagPipeline)()
     except GuideRetrievalUnavailable:
         logger.exception("guide_retrieval_unavailable_during_startup")
         await cl.Message(
@@ -120,15 +98,14 @@ async def on_chat_start():
 
     cl.user_session.set("pipeline", pipeline)
     cl.user_session.set("history", [])
-    provider_label = "Anthropic (Claude)" if provider == "anthropic" else "OpenAI"
-    await cl.Message(content=f"{WELCOME}\n\n**Selected provider:** {provider_label}").send()
+    await cl.Message(content=WELCOME).send()
 
 
 @cl.on_message
 async def on_message(message: cl.Message):
     pipeline: RagPipeline = cl.user_session.get("pipeline")
     if pipeline is None:
-        await cl.Message(content="Choose a provider to start the chat before sending a question.").send()
+        await cl.Message(content="The chatbot is still starting. Please begin a new chat and try again.").send()
         return
     history: list[dict] = cl.user_session.get("history")
     question = message.content
@@ -164,7 +141,7 @@ async def on_message(message: cl.Message):
     except Exception:
         logger.exception("chat_request_failed trace_id=%s", trace_id)
         await cl.Message(
-            content="I couldn't complete that request because both AI providers failed. Please try again shortly."
+            content="I couldn't complete that request because the AI service failed. Please try again shortly."
         ).send()
         return
 

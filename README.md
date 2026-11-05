@@ -28,7 +28,7 @@ cd RAG
 
 # 2. Fill in credentials
 cp .env.example .env
-#    then edit .env and set ANTHROPIC_API_KEY, OPENAI_API_KEY, and PINECONE_API_KEY
+#    then edit .env and set OPENAI_API_KEY and PINECONE_API_KEY
 
 # 3. Build
 docker build -t chatbot:1.0 .
@@ -51,10 +51,10 @@ If you change `PORT` in `.env`, map that port instead, e.g. `PORT=9000` →
 
 | Role            | Model                                              | Notes |
 | --------------- | -------------------------------------------------- | ----- |
-| Chat / generation | **Claude Opus 4.8** — `claude-opus-4-8` (Anthropic), or **GPT-6 Luna** — `gpt-6-luna` (OpenAI) | The user chooses a provider when a chat starts; if it fails, the other provider is tried automatically. |
+| Chat / generation | **GPT-6 Luna** — `gpt-6-luna` (OpenAI) | The configured OpenAI model is used for every chat. |
 | Embeddings      | **BAAI/bge-small-en-v1.5** (384-dim)               | open model run in-container via `sentence-transformers`; no extra API key, and it let me benchmark retrieval offline |
 
-The chat models are configurable (`ANTHROPIC_CHAT_MODEL`, `OPENAI_CHAT_MODEL`). The
+The chat model is configurable with `OPENAI_CHAT_MODEL`. The
 embedding model and dimension are intentionally locked to the pre-ingested Pinecone
 index; changing either requires re-ingestion and a matching image build.
 
@@ -80,7 +80,7 @@ Pinned versions are in [`requirements.txt`](requirements.txt).
   user ─► contextualize ─► retrieve(top-5) ─► grounded? ─no─► "I couldn't find this…"
                                                   │yes
                                                   ▼
-                                   generate (Claude Opus 4.8) ─► answer + Sources
+                                   generate (GPT-6 Luna) ─► answer + Sources
 ```
 
 - **`src/pdf_loader.py`** — parses the guide with PyMuPDF, using font size and the
@@ -101,9 +101,9 @@ Pinned versions are in [`requirements.txt`](requirements.txt).
   given no licence to use outside knowledge. Earlier turns are used only to interpret
   the question, never as a source of facts.
 - **Explicit "not in the document" fallback.** Two layers: a relevance gate refuses
-  before the model is called when retrieval is empty/too weak; and the model itself
-  replies *"I couldn't find this in the iPhone User Guide."* when the excerpts don't
-  answer the question. Citations are dropped on any refusal. Details and the measured
+  before the model is called when retrieval is empty/too weak; and the model returns a
+  structured refusal when the excerpts don't answer the question. Citations are dropped
+  on any refusal. Details and the measured
   threshold are in [`docs/retrieval.md`](docs/retrieval.md).
 - **Page/section citations on every answer.** The answer model returns claims linked to
   excerpt IDs. A separate evidence check must approve every claim; the application then
@@ -119,9 +119,8 @@ Pinned versions are in [`requirements.txt`](requirements.txt).
 
 Every required variable is documented in [`.env.example`](.env.example). The real
 `.env` is gitignored and is **never** committed — no key appears anywhere in the git
-history. Required at run time: `PINECONE_API_KEY` and at least one of `ANTHROPIC_API_KEY` or
-`OPENAI_API_KEY` (plus the index name, which defaults to `iphone-user-guide`). Provide both
-keys to enable automatic failover.
+history. Required at run time: `PINECONE_API_KEY` and `OPENAI_API_KEY` (plus the index name,
+which defaults to `iphone-user-guide`).
 
 ## Re-running ingestion (not needed for grading)
 
@@ -149,4 +148,4 @@ python -m eval.deepeval_eval
 
 `run_eval` prints the hit@5 / MRR tables quoted in the design notes. `deepeval_eval`
 scores the generated answers for faithfulness (groundedness), answer relevancy, and
-contextual relevancy, using Claude itself as the judge.
+contextual relevancy, using the configured OpenAI model as the judge.

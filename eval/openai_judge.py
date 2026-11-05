@@ -1,23 +1,22 @@
-"""A DeepEval judge model backed by Claude.
-
-DeepEval defaults to OpenAI as the judge LLM. I don't use OpenAI anywhere else in
-this project, so I wrap the same Anthropic chat model the app uses as the evaluator
-instead — one provider, one key. DeepEval's metrics ask the judge for structured
-(schema-typed) output, which I get from langchain's `with_structured_output`.
-"""
+"""A DeepEval judge model backed by the configured OpenAI chat model."""
 
 from __future__ import annotations
 
 from deepeval.models import DeepEvalBaseLLM
-from langchain_anthropic import ChatAnthropic
+from langchain_openai import ChatOpenAI
 
 from src.config import settings
 
 
-class ClaudeJudge(DeepEvalBaseLLM):
+class OpenAIJudge(DeepEvalBaseLLM):
     def __init__(self, model: str | None = None):
-        self.model = model or settings.anthropic_chat_model
-        self._chat = ChatAnthropic(model=self.model, max_tokens=2048, timeout=120)
+        self.model = model or settings.openai_chat_model
+        self._chat = ChatOpenAI(
+            model=self.model,
+            max_completion_tokens=2048,
+            timeout=120,
+            api_key=settings.openai_api_key,
+        )
 
     def load_model(self):
         return self._chat

@@ -2,7 +2,7 @@
 
 I use BAAI/bge-small-en-v1.5 directly through sentence-transformers rather than a
 hosted embedding API. Two reasons: it needs no extra API key (the only secrets the
-graders set are Anthropic + Pinecone), and running it locally is exactly what let
+graders set are OpenAI + Pinecone), and running it locally is exactly what let
 me benchmark chunking and embedding choices offline (docs/embeddings.md).
 
 bge models expect a short instruction prefixed to *queries* (not documents) for

@@ -7,7 +7,6 @@ langchain-text-splitters==1.1.2
 langgraph==1.2.6
 
 # Models
-langchain-anthropic==1.4.6
 langchain-huggingface==1.2.2
 langchain-openai==1.1.12
 sentence-transformers==5.6.0

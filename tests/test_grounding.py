@@ -1,6 +1,7 @@
 """Unit tests for fail-closed claim/evidence grounding and citation rendering."""
 
 from langchain_core.documents import Document
+from dataclasses import replace
 import json
 import pytest
 
@@ -13,7 +14,7 @@ from src.prompts import (
     NO_CONTEXT_REPLY,
 )
 from src.rag_graph import (
-    _FailoverChatModel,
+    _OpenAIChatModel,
     GuideRetrievalUnavailable,
     RagPipeline,
     _bounded_history,
@@ -34,7 +35,6 @@ class _Response:
 
 class _ScriptedModel:
     active_name = "test"
-    _fallback_name = "fallback"
 
     def __init__(self, responses):
         self.responses = iter(responses)
@@ -86,18 +86,16 @@ def test_openai_model_uses_provider_default_temperature(monkeypatch):
         created["openai"] = kwargs
         return _FakeChatModel(**kwargs)
 
-    def fake_anthropic(**kwargs):
-        created["anthropic"] = kwargs
-        return _FakeChatModel(**kwargs)
-
     monkeypatch.setattr(rag_graph, "ChatOpenAI", fake_openai)
-    monkeypatch.setattr(rag_graph, "ChatAnthropic", fake_anthropic)
     monkeypatch.setattr(rag_graph, "get_vectorstore", lambda: object())
     monkeypatch.setattr(RagPipeline, "_build", lambda _self: object())
+    monkeypatch.setattr(rag_graph, "settings", replace(rag_graph.settings, openai_api_key="test-key"))
 
-    RagPipeline(provider="openai")
+    RagPipeline()
 
     assert "temperature" not in created["openai"]
+    assert created["openai"]["max_completion_tokens"] == rag_graph.settings.openai_max_completion_tokens
+    assert created["openai"]["reasoning_effort"] == rag_graph.settings.openai_reasoning_effort
 
 
 def test_openai_uses_json_mode_only_for_object_shaped_structured_stages():
@@ -113,16 +111,14 @@ def test_openai_uses_json_mode_only_for_object_shaped_structured_stages():
             return _Response('{"claims": []}')
 
     openai = _Model()
-    anthropic = _Model()
-    model = _FailoverChatModel("openai", openai, "anthropic", anthropic)
+    model = _OpenAIChatModel(openai)
 
     model.set_stage("generate_claims")
     model.invoke([])
     model.set_stage("split_retrieval_queries")
     model.invoke([])
 
-    assert openai.bound == [{"response_format": {"type": "json_object"}}]
-    assert anthropic.bound == []
+    assert openai.bound == [{"response_format": _OpenAIChatModel._CLAIMS_RESPONSE_FORMAT}]
 
 
 def test_validator_prompt_accepts_concise_directly_supported_procedural_claims_without_relaxing_entailment():
@@ -187,6 +183,49 @@ def test_invalid_evidence_identifier_and_empty_evidence_fail_closed():
 
     pipeline = _pipeline(['{"claims":[]}'])
     assert pipeline._generate(_state()) == {"answer": NO_CONTEXT_REPLY, "sources": [], "grounded": False}
+
+
+def test_explicit_structured_refusal_fails_closed():
+    pipeline = _pipeline(['{"claims":null,"refusal":true}'])
+
+    assert pipeline._generate(_state(_doc())) == {
+        "answer": NO_CONTEXT_REPLY,
+        "sources": [],
+        "grounded": False,
+    }
+
+
+def test_claim_validation_failure_sets_a_reason_when_retrieval_left_an_empty_one():
+    pipeline = _pipeline([
+        '{"claims":[{"text":"Open Settings.","evidence_ids":[1]}],"refusal":null}',
+        '{"supported_claim_indexes":[]}',
+    ])
+    state = _state(_doc())
+    state["refusal_reason"] = ""
+
+    pipeline._generate(state)
+
+    assert state["refusal_reason"] == "claim_validation_failed"
+
+
+def test_contextualization_failure_falls_back_to_the_sanitized_question(monkeypatch):
+    pipeline = object.__new__(RagPipeline)
+    monkeypatch.setattr(pipeline, "_contextualize", lambda _state: (_ for _ in ()).throw(RuntimeError()))
+
+    result = pipeline._contextualize_with_retry({"question": "How do I set an alarm?", "history": []})
+
+    assert result["standalone_question"] == "How do I set an alarm?"
+    assert result["needs_clarification"] is False
+
+
+def test_claim_retry_adds_schema_correction_instruction():
+    state = _state(_doc())
+    state["claim_generation_attempt"] = 2
+
+    messages = _pipeline([])._claim_messages(state)
+
+    assert len(messages) == 3
+    assert "could not be safely rendered" in messages[-1].content
 
 
 def test_final_generation_messages_exclude_raw_history():

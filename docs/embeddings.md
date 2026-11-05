@@ -9,7 +9,7 @@ through `sentence-transformers==5.6.0`. 384-dimensional, normalised embeddings.
 
 I had three requirements and bge-small hit all of them:
 
-1. **No extra API key / no per-query cost.** The graders only set Anthropic and
+1. **No extra API key / no per-query cost.** The graders only set OpenAI and
    Pinecone keys. A hosted embedding API (OpenAI `text-embedding-3-small` etc.) would
    add a third secret and bill on every query. bge-small runs in-process, so embedding
    is free and offline. It's ~130 MB, which I bake into the Docker image at build time

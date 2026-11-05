@@ -57,11 +57,11 @@ whole grounding story.
 
 **Layer 2 — the model's refusal instruction, the authoritative check.** The system
 prompt (`src/prompts.py`) tells the model, in plain terms, to use only the excerpts and
-to reply with the exact sentence *"I couldn't find this in the iPhone User Guide."* when
-they don't answer the question. This is what catches the overlap region: a question
-about baking bread scores ~0.575 (above the gate), retrieves some iPhone text, and the
-model correctly refuses because that text doesn't answer it. When the model returns the
-refusal sentence, the graph drops any citations — I never cite sources for a non-answer.
+to return an explicit structured refusal when they don't answer the question. This is
+what catches the overlap region: a question about baking bread scores ~0.575 (above the
+gate), retrieves some iPhone text, and the model correctly refuses because that text
+doesn't answer it. The graph renders the refusal message itself and drops citations — I
+never cite sources for a non-answer.
 
 I validated all four paths offline with stubbed retrieval and model: strong match →
 grounded + cited; weak score → hard refuse (no model call); gate-passing but
