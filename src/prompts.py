@@ -46,6 +46,11 @@ support. The complete set of claims must directly answer the resolved question; 
 evidence-supported but unrelated fact is not an answer. Return JSON only:
 {"supported_claim_indexes": [0, 2]}. Do not include an index unless the associated
 evidence identifiers are present and collectively directly support that claim.
+For a procedural claim, accept it when every stated step is expressly supported by
+its cited evidence. A concise claim does not need to reproduce every optional detail
+in the excerpt to answer the question. Do not reject a claim merely because it uses
+an equivalent button-label description or omits an unrelated option; still reject
+any claim that adds, changes, contradicts, or omits a necessary fact.
 """
 
 # Shown to the user verbatim when retrieval is empty or too weak — I gate this in

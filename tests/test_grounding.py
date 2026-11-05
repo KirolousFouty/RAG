@@ -1,16 +1,29 @@
 """Unit tests for fail-closed claim/evidence grounding and citation rendering."""
 
 from langchain_core.documents import Document
+import json
 import pytest
 
-from src.prompts import CLARIFICATION_REPLY, GUIDE_SUMMARY, GUIDE_SUMMARY_SOURCES, NO_CONTEXT_REPLY
+import src.rag_graph as rag_graph
+from src.prompts import (
+    CLAIM_VALIDATION_PROMPT,
+    CLARIFICATION_REPLY,
+    GUIDE_SUMMARY,
+    GUIDE_SUMMARY_SOURCES,
+    NO_CONTEXT_REPLY,
+)
 from src.rag_graph import (
+    _FailoverChatModel,
     GuideRetrievalUnavailable,
     RagPipeline,
     _bounded_history,
     _json_object,
+    _normalise_retrieval_question,
     _parse_contextualization,
+    _parse_retrieval_queries,
+    _requires_model_split,
     _sanitize_question,
+    _split_fallback_queries,
 )
 
 
@@ -33,7 +46,7 @@ class _ScriptedModel:
     def set_trace(self, _trace_id):
         pass
 
-    def invoke(self, messages):
+    def invoke(self, messages, **_kwargs):
         self.messages.append(messages)
         return _Response(next(self.responses))
 
@@ -59,6 +72,62 @@ def _doc(page=32, source="guide.pdf", text="Open Settings, then enable the featu
         page_content=text,
         metadata={"page": page, "source": source, "section": "Feature", "chapter": "Basics"},
     )
+
+
+def test_openai_model_uses_provider_default_temperature(monkeypatch):
+    """Models that only accept their default temperature must remain callable."""
+    created = {}
+
+    class _FakeChatModel:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    def fake_openai(**kwargs):
+        created["openai"] = kwargs
+        return _FakeChatModel(**kwargs)
+
+    def fake_anthropic(**kwargs):
+        created["anthropic"] = kwargs
+        return _FakeChatModel(**kwargs)
+
+    monkeypatch.setattr(rag_graph, "ChatOpenAI", fake_openai)
+    monkeypatch.setattr(rag_graph, "ChatAnthropic", fake_anthropic)
+    monkeypatch.setattr(rag_graph, "get_vectorstore", lambda: object())
+    monkeypatch.setattr(RagPipeline, "_build", lambda _self: object())
+
+    RagPipeline(provider="openai")
+
+    assert "temperature" not in created["openai"]
+
+
+def test_openai_uses_json_mode_only_for_object_shaped_structured_stages():
+    class _Model:
+        def __init__(self):
+            self.bound = []
+
+        def bind(self, **kwargs):
+            self.bound.append(kwargs)
+            return self
+
+        def invoke(self, _messages):
+            return _Response('{"claims": []}')
+
+    openai = _Model()
+    anthropic = _Model()
+    model = _FailoverChatModel("openai", openai, "anthropic", anthropic)
+
+    model.set_stage("generate_claims")
+    model.invoke([])
+    model.set_stage("split_retrieval_queries")
+    model.invoke([])
+
+    assert openai.bound == [{"response_format": {"type": "json_object"}}]
+    assert anthropic.bound == []
+
+
+def test_validator_prompt_accepts_concise_directly_supported_procedural_claims_without_relaxing_entailment():
+    assert "every stated step is expressly supported" in CLAIM_VALIDATION_PROMPT
+    assert "adds, changes, contradicts" in CLAIM_VALIDATION_PROMPT
 
 
 def test_claim_citation_is_resolved_from_metadata_not_model_page_text():
@@ -255,6 +324,43 @@ def test_ambiguous_stream_short_circuits_before_retrieval():
     ]
 
 
+def test_clarification_is_retried_up_to_three_times_before_rendering():
+    pipeline = _pipeline([])
+    calls = 0
+
+    def contextualize(_state):
+        nonlocal calls
+        calls += 1
+        return {"standalone_question": "", "needs_clarification": True, "answer_language": "en"}
+
+    pipeline._contextualize = contextualize
+
+    result = pipeline._contextualize_with_retry({"question": "What about it?", "trace_id": "test"})
+
+    assert calls == 4  # initial decision plus three retries
+    assert result["needs_clarification"] is True
+
+
+def test_no_context_is_retried_up_to_three_times_without_retrying_unsupported_models():
+    pipeline = object.__new__(RagPipeline)
+    pipeline.llm = _ScriptedModel([])
+    attempts = 0
+
+    def no_evidence(_state, _question):
+        nonlocal attempts
+        attempts += 1
+        return {"grounded": False, "refusal_reason": "no_relevant_evidence", "question": "volume"}
+
+    pipeline._subrequest_state = no_evidence
+    pipeline._refuse = lambda state: {"answer": NO_CONTEXT_REPLY, "sources": [], "grounded": False}
+
+    result, reason = pipeline._resolve_subrequest_with_retry({"trace_id": "test"}, "volume")
+
+    assert attempts == 4  # initial retrieval plus three retries
+    assert result["answer"] == NO_CONTEXT_REPLY
+    assert reason == "no_relevant_evidence"
+
+
 def test_evidence_supported_but_irrelevant_claim_is_rejected_by_validator():
     pipeline = _pipeline([
         '{"claims":[{"text":"Presidential alerts are available in the United States.","evidence_ids":[1]}]}',
@@ -385,17 +491,17 @@ def test_arabic_unsupported_question_localizes_refusal_without_sources():
     }
     pipeline._split_retrieval_queries = lambda _state: {"retrieval_queries": ["Who won the World Cup?"]}
     pipeline._subrequest_state = lambda state, question: {**state, "question": question, "grounded": False}
-    pipeline._localize_answer = lambda _answer, _language: "لم أجد هذا في دليل مستخدم iPhone."
-
     events = list(pipeline.stream_answer("من فاز بكأس العالم؟"))
 
     assert events[-1]["final"] == {
-        "answer": "لم أجد هذا في دليل مستخدم iPhone.", "sources": [], "grounded": False
+        "answer": "لم أجد معلومات كافية في دليل مستخدم iPhone للإجابة عن هذا الطلب.",
+        "sources": [],
+        "grounded": False,
     }
 
 
 def test_language_request_is_excluded_from_the_retrieval_splitter_input():
-    pipeline = _pipeline(['["How do I take a panorama photo?"]'])
+    pipeline = _pipeline([])
     state = {
         "question": "Explain how to take a panorama in Arabic, including the supporting page number.",
         "standalone_question": "How do I take a panorama photo?",
@@ -405,7 +511,7 @@ def test_language_request_is_excluded_from_the_retrieval_splitter_input():
     result = pipeline._split_retrieval_queries(state)
 
     assert result == {"retrieval_queries": ["How do I take a panorama photo?"]}
-    assert pipeline.llm.messages[0][-1].content == "How do I take a panorama photo?"
+    assert pipeline.llm.messages == []
 
 
 def test_arabic_ambiguity_and_history_follow_up_keep_distinct_outcomes():
@@ -424,3 +530,526 @@ def test_arabic_ambiguity_and_history_follow_up_keep_distinct_outcomes():
     assert ambiguous["answer_language"] == "ar"
     assert follow_up["needs_clarification"] is False
     assert follow_up["standalone_question"] == "Can panorama mode be used on iPhone 4s?"
+
+
+@pytest.mark.parametrize(
+    ("question", "expected"),
+    [
+        ("how to increasese volume", "how to increase volume"),
+        ("how to increse volume", "how to increase volume"),
+        ("how to incraese volume", "how to increase volume"),
+        ("how to decrase volume", "how to decrease volume"),
+        ("how to tak a panaroma pikchure", "how to take a panorama picture"),
+        ("how to use Airdorp", "how to use AirDrop"),
+    ],
+)
+def test_typo_normalization_repairs_only_clear_safe_terms(question, expected):
+    assert _normalise_retrieval_question(question) == expected
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "How do I increase volume?", "How do I decrease volume?",
+        "How do I disable AirDrop?", "How do I enable AirDrop?",
+        "Does this work on iPhone 4?", "Does this work on iPhone 4s?",
+        "What does page 11 say?", "What does page 111 say?",
+        "How do I use iSight and Pano?", "How do I use XyloFlux?",
+    ],
+)
+def test_typo_normalization_preserves_intent_identifiers_and_numbers(question):
+    assert _normalise_retrieval_question(question) == question
+
+
+def test_typo_and_correct_query_share_retrieval_validation_and_citation_flow():
+    class _VolumeVectorStore:
+        def __init__(self):
+            self.queries = []
+
+        def similarity_search_with_score(self, query, **_kwargs):
+            self.queries.append(query)
+            if query != "how to increase volume":
+                return []
+            return [
+                (_doc(page=11, text="Use the volume buttons to adjust volume."), 0.91),
+                (_doc(page=66, text="Sound settings also control volume."), 0.89),
+            ]
+
+    def run(question):
+        pipeline = _pipeline([
+            f'{{"standalone_question":"{question}","needs_clarification":false,"answer_language":"en"}}',
+            '{"claims":[{"text":"Use the volume buttons.","evidence_ids":[1]},'
+            '{"text":"You can also adjust sound settings.","evidence_ids":[2]}]}',
+            '{"supported_claim_indexes":[0,1]}',
+        ])
+        store = _VolumeVectorStore()
+        pipeline.vectorstore = store
+        return list(pipeline.stream_answer(question))[-1]["final"], store, pipeline
+
+    correct, correct_store, correct_pipeline = run("how to increase volume")
+    typo, typo_store, typo_pipeline = run("how to increasese volume")
+
+    assert correct_store.queries == typo_store.queries == ["how to increase volume"]
+    assert typo == correct
+    assert typo["grounded"] is True
+    assert "(page 11)" in typo["answer"] and "(page 66)" in typo["answer"]
+    assert len(correct_pipeline.llm.messages) == len(typo_pipeline.llm.messages) == 3
+    assert "<question>how to increase volume</question>" in typo_pipeline.llm.messages[-1][1].content
+
+
+def test_splitter_is_skipped_for_single_request_and_retained_for_multi_request():
+    pipeline = _pipeline(['["How do I increase volume?", "How do I decrease volume?"]'])
+
+    simple = pipeline._split_retrieval_queries(
+        {"question": "How do I increase volume?", "standalone_question": "How do I increase volume?"}
+    )
+    multi = pipeline._split_retrieval_queries(
+        {
+            "question": "How do I increase volume and decrease volume?",
+            "standalone_question": "How do I increase volume and decrease volume?",
+        }
+    )
+
+    assert simple == {"retrieval_queries": ["How do I increase volume?"]}
+    assert multi == {"retrieval_queries": ["How do I increase volume?", "How do I decrease volume?"]}
+    assert len(pipeline.llm.messages) == 1
+    assert not _requires_model_split("How do I increase volume?")
+    assert _requires_model_split("How do I increase volume and decrease volume?")
+
+
+def test_malformed_or_collapsed_splitter_output_preserves_explicit_multi_intent_boundaries():
+    original = "Tell me about volume controls; also explain Pano."
+    # This is a realistic contextualizer variation: it keeps both intents but
+    # removes the semicolon that the deterministic fallback previously relied on.
+    rewritten = "Tell me about volume controls and explain Pano."
+    fallback = _split_fallback_queries(rewritten, original)
+
+    assert fallback == ["Tell me about volume controls", "also explain Pano"]
+    assert _parse_retrieval_queries("not JSON", fallback) == fallback
+    assert _parse_retrieval_queries('["Tell me about volume controls and explain Pano."]', fallback) == fallback
+
+
+def test_volume_and_pano_survive_contextualizer_and_splitter_variability_end_to_end():
+    """Reproduce the live failure path without a provider or Pinecone call.
+
+    The contextualizer's valid rewrite removes the user's semicolon and the
+    splitter returns malformed JSON. Before the fallback-boundary fix, retrieval
+    received one combined query, no feature-specific evidence, and refused.
+    """
+    class _TopicStore:
+        def __init__(self):
+            self.queries = []
+
+        def similarity_search_with_score(self, query, **_kwargs):
+            self.queries.append(query)
+            if "volume" in query and "Pano" not in query:
+                return [(_doc(11, text="Use the volume buttons to adjust volume."), 0.91)]
+            if "Pano" in query and "volume" not in query:
+                return [(_doc(79, text="Choose Pano, then pan slowly."), 0.92)]
+            return []
+
+    pipeline = _pipeline([
+        '{"standalone_question":"Tell me about volume controls and explain Pano.",'
+        '"needs_clarification":false,"answer_language":"en"}',
+        "not JSON",
+        '{"claims":[{"text":"Use the volume buttons.","evidence_ids":[1]}]}',
+        '{"supported_claim_indexes":[0]}',
+        '{"claims":[{"text":"Choose Pano and pan slowly.","evidence_ids":[1]}]}',
+        '{"supported_claim_indexes":[0]}',
+    ])
+    store = _TopicStore()
+    pipeline.vectorstore = store
+
+    result = list(pipeline.stream_answer(
+        "Tell me about volume controls; also explain Pano."
+    ))[-1]["final"]
+
+    assert store.queries == ["Tell me about volume controls", "also explain Pano"]
+    assert result["grounded"] is True
+    assert "(page 11)" in result["answer"] and "(page 79)" in result["answer"]
+
+
+def test_incomplete_contextualizer_information_needs_do_not_bypass_explicit_multi_intent_split():
+    result = _parse_contextualization(
+        '{"standalone_question":"What are the volume controls, and what is Pano?",'
+        '"needs_clarification":false,"answer_language":"en",'
+        '"information_needs":["What are the volume controls, and what is Pano?"],'
+        '"relationship":"single_question"}',
+        "Tell me about volume controls; also explain Pano.",
+        [],
+    )
+
+    assert result["standalone_question"] == "What are the volume controls, and what is Pano?"
+    assert "information_needs" not in result
+
+
+def test_incomplete_contextualizer_plan_follows_splitter_and_recovers_both_supported_topics():
+    class _TopicStore:
+        def similarity_search_with_score(self, query, **_kwargs):
+            if "volume" in query:
+                return [(_doc(11, text="Use the volume buttons to adjust volume."), 0.91)]
+            if "Pano" in query:
+                return [(_doc(79, text="Choose Pano, then pan slowly."), 0.92)]
+            return []
+
+    pipeline = _pipeline([
+        '{"standalone_question":"What are the volume controls, and what is Pano?",'
+        '"needs_clarification":false,"answer_language":"en",'
+        '"information_needs":["What are the volume controls, and what is Pano?"],'
+        '"relationship":"single_question"}',
+        '["What volume controls are available on iPhone?", "What is Pano on iPhone?"]',
+        '{"claims":[{"text":"Use the volume buttons.","evidence_ids":[1]}]}',
+        '{"supported_claim_indexes":[0]}',
+        '{"claims":[{"text":"Choose Pano and pan slowly.","evidence_ids":[1]}]}',
+        '{"supported_claim_indexes":[0]}',
+    ])
+    pipeline.vectorstore = _TopicStore()
+
+    result = list(pipeline.stream_answer(
+        "Tell me about volume controls; also explain Pano.", trace_id="trace"
+    ))[-1]["final"]
+
+    assert result["grounded"] is True
+    assert "(page 11)" in result["answer"] and "(page 79)" in result["answer"]
+
+
+def test_contextualized_information_needs_retrieve_two_supported_topics_without_splitter():
+    class _TopicStore:
+        def __init__(self):
+            self.queries = []
+
+        def similarity_search_with_score(self, query, **_kwargs):
+            self.queries.append(query)
+            if "increase" in query:
+                return [(_doc(11, text="Use the volume buttons to adjust volume."), 0.92)]
+            if "panorama" in query:
+                return [(_doc(79, text="Choose Pano, then pan slowly."), 0.93)]
+            return []
+
+    pipeline = _pipeline([
+        '{"standalone_question":"Explain volume and panorama.","needs_clarification":false,'
+        '"answer_language":"en","information_needs":["How do I increase volume?",'
+        '"How do I take a panorama photo?"],"relationship":"independent_procedures"}',
+        '{"claims":[{"text":"Use the volume buttons.","evidence_ids":[1]}]}',
+        '{"supported_claim_indexes":[0]}',
+        '{"claims":[{"text":"Choose Pano and pan slowly.","evidence_ids":[1]}]}',
+        '{"supported_claim_indexes":[0]}',
+    ])
+    store = _TopicStore()
+    pipeline.vectorstore = store
+
+    result = list(pipeline.stream_answer(
+        "Explain how to increase the volume and how to take a panorama photo."
+    ))[-1]["final"]
+
+    assert store.queries == ["How do I increase volume?", "How do I take a panorama photo?"]
+    assert "(page 11)" in result["answer"] and "(page 79)" in result["answer"]
+    assert NO_CONTEXT_REPLY not in result["answer"]
+    # Contextualization plus generation/validation for each need: no splitter call.
+    assert len(pipeline.llm.messages) == 5
+
+
+def test_combined_behavior_keeps_supported_facts_separate_from_undocumented_interaction():
+    class _TopicStore:
+        def similarity_search_with_score(self, query, **_kwargs):
+            if "interaction" in query:
+                return []
+            if "volume" in query:
+                return [(_doc(11, text="Use the volume buttons to adjust volume."), 0.92)]
+            return [(_doc(79, text="Choose Pano, then pan slowly."), 0.93)]
+
+    pipeline = _pipeline([
+        '{"standalone_question":"Can I make iPhone louder while taking panorama?",'
+        '"needs_clarification":false,"answer_language":"en","information_needs":['
+        '"How do I increase volume?","How do I take a panorama photo?",'
+        '"Does the guide document the interaction between volume controls and panorama photography?"],'
+        '"relationship":"combined_behavior"}',
+        '{"claims":[{"text":"Use the volume buttons.","evidence_ids":[1]}]}',
+        '{"supported_claim_indexes":[0]}',
+        '{"claims":[{"text":"Choose Pano and pan slowly.","evidence_ids":[1]}]}',
+        '{"supported_claim_indexes":[0]}',
+    ])
+    pipeline.vectorstore = _TopicStore()
+
+    result = list(pipeline.stream_answer(
+        "How can I make my iPhone louder while taking a panorama photo?"
+    ))[-1]["final"]
+
+    assert "(page 11)" in result["answer"] and "(page 79)" in result["answer"]
+    assert "does not provide enough evidence to establish the requested interaction" in result["answer"]
+    assert NO_CONTEXT_REPLY not in result["answer"]
+
+
+def test_egyptian_arabic_multi_intent_keeps_all_visible_outcomes_in_arabic():
+    class _TopicStore:
+        def similarity_search_with_score(self, query, **_kwargs):
+            if "volume" in query:
+                return [(_doc(11, text="Use the volume buttons to adjust volume."), 0.92)]
+            return [(_doc(79, text="Choose Pano, then pan slowly."), 0.93)]
+
+    pipeline = _pipeline([
+        '{"standalone_question":"Increase volume and take panorama.","needs_clarification":false,'
+        '"answer_language":"en","information_needs":["How do I increase volume?",'
+        '"How do I take a panorama photo?"],"relationship":"independent_procedures"}',
+        '{"claims":[{"text":"Use the volume buttons.","evidence_ids":[1]}]}',
+        '{"supported_claim_indexes":[0]}',
+        '{"translations":["استخدم أزرار الصوت."]}',
+        '{"claims":[{"text":"Choose Pano and pan slowly.","evidence_ids":[1]}]}',
+        '{"supported_claim_indexes":[0]}',
+        '{"translations":["اختر Pano وحرّك iPhone ببطء."]}',
+    ])
+    pipeline.vectorstore = _TopicStore()
+
+    result = list(pipeline.stream_answer("ازاي اعلي صوت الايفون واصور بانوراما؟"))[-1]["final"]
+
+    assert result["grounded"] is True
+    assert "استخدم أزرار الصوت." in result["answer"]
+    assert "اختر Pano" in result["answer"]
+    assert "(page 11)" in result["answer"] and "(page 79)" in result["answer"]
+    assert NO_CONTEXT_REPLY not in result["answer"]
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "how to increase volume",
+        "How do you increase the volume on iPhone?",
+        "How do I turn up the volume on my iPhone?",
+        "How do the volume buttons work?",
+        "How do I adjust the ringer volume?",
+        "how to increasese volume",
+    ],
+)
+def test_equivalent_volume_queries_reach_the_real_relevance_gate_with_page_11_evidence(question):
+    class _VolumeStore:
+        def __init__(self):
+            self.queries = []
+
+        def similarity_search_with_score(self, query, **_kwargs):
+            self.queries.append(query)
+            return [(_doc(page=11, text="The side buttons adjust audio and ringer volume."), 0.82)]
+
+    pipeline = object.__new__(RagPipeline)
+    pipeline.vectorstore = _VolumeStore()
+    normalized = _normalise_retrieval_question(question)
+    result = pipeline._retrieve({
+        "question": normalized,
+        "standalone_question": normalized,
+        "retrieval_queries": [normalized],
+        "trace_id": "volume-regression",
+    })
+
+    assert result["grounded"] is True
+    assert result["top_score"] == 0.82
+    assert result["documents"][0].metadata["page"] == 11
+    assert pipeline.vectorstore.queries == [normalized]
+
+
+def test_weak_retrieval_is_retried_once_before_a_ui_refusal():
+    class _TransientVolumeStore:
+        def __init__(self):
+            self.calls = 0
+
+        def similarity_search_with_score(self, _query, **_kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return []
+            return [(_doc(page=11, text="Use the side buttons to adjust volume."), 0.82)]
+
+    pipeline = _pipeline([
+        '{"standalone_question":"How do I increase volume?","needs_clarification":false,"answer_language":"en"}',
+        '{"claims":[{"text":"Use the side buttons.","evidence_ids":[1]}]}',
+        '{"supported_claim_indexes":[0]}',
+    ])
+    store = _TransientVolumeStore()
+    pipeline.vectorstore = store
+
+    result = list(pipeline.stream_answer("How do I increase volume?"))[-1]["final"]
+
+    assert store.calls == 2
+    assert result["grounded"] is True
+    assert result["answer"] == "Use the side buttons. (page 11)"
+
+
+def test_claim_validation_is_retried_once_with_the_same_retrieved_evidence():
+    class _VolumeStore:
+        def __init__(self):
+            self.calls = 0
+
+        def similarity_search_with_score(self, _query, **_kwargs):
+            self.calls += 1
+            return [(_doc(page=11, text="Use the side buttons to adjust volume."), 0.82)]
+
+    pipeline = _pipeline([
+        '{"standalone_question":"How do I increase volume?","needs_clarification":false,"answer_language":"en"}',
+        '{"claims":[{"text":"Unsupported wording.","evidence_ids":[1]}]}',
+        '{"supported_claim_indexes":[]}',
+        '{"claims":[{"text":"Use the side buttons.","evidence_ids":[1]}]}',
+        '{"supported_claim_indexes":[0]}',
+    ])
+    store = _VolumeStore()
+    pipeline.vectorstore = store
+
+    result = list(pipeline.stream_answer("How do I increase volume?"))[-1]["final"]
+
+    assert store.calls == 1
+    assert result["grounded"] is True
+    assert result["answer"] == "Use the side buttons. (page 11)"
+    # Contextualization plus two generation/validation attempts; no simple-query splitter call.
+    assert len(pipeline.llm.messages) == 5
+
+
+_MULTIPART_TOPICS = {
+    "alarm": (85, "Create an alarm in Clock."),
+    "reminder": (94, "Create a reminder in Reminders."),
+    "calendar": (70, "Add an event in Calendar."),
+    "volume": (11, "Use the volume buttons."),
+    "pano": (79, "Choose Pano and pan slowly."),
+    "screenshot": (17, "Take a screenshot with the Sleep/Wake and Home buttons."),
+}
+
+
+def _multipart_pipeline(question, needs, language="en"):
+    """Exercise stream_answer with independent mocked retrieval and LLM stages."""
+    responses = [json.dumps({
+        "standalone_question": "; ".join(needs),
+        "needs_clarification": False,
+        "answer_language": language,
+        "information_needs": needs,
+        "relationship": "independent_procedures" if len(needs) > 1 else "single_question",
+    })]
+    for need in needs:
+        key = next(key for key in _MULTIPART_TOPICS if key in need.lower())
+        _page, claim = _MULTIPART_TOPICS[key]
+        responses.extend([
+            json.dumps({"claims": [{"text": claim, "evidence_ids": [1]}]}),
+            json.dumps({"supported_claim_indexes": [0]}),
+        ])
+        if language == "ar":
+            responses.append(json.dumps({"translations": [f"خطوات {key}."]}))
+
+    class _TopicStore:
+        def __init__(self):
+            self.queries = []
+
+        def similarity_search_with_score(self, query, **_kwargs):
+            self.queries.append(query)
+            for key, (page, text) in _MULTIPART_TOPICS.items():
+                if key in query.lower():
+                    return [(_doc(page, text=text), 0.88)]
+            return []
+
+    pipeline = _pipeline(responses)
+    store = _TopicStore()
+    pipeline.vectorstore = store
+    return pipeline, store
+
+
+@pytest.mark.parametrize(
+    ("question", "need", "page"),
+    [
+        ("How do I set an alarm?", "How do I set an alarm?", 85),
+        ("How do I create a reminder?", "How do I create a reminder?", 94),
+        ("How do I add a calendar event?", "How do I add a calendar event?", 70),
+    ],
+)
+def test_distant_chapter_procedures_retrieve_and_validate_independently(question, need, page):
+    pipeline, store = _multipart_pipeline(question, [need])
+
+    result = list(pipeline.stream_answer(question))[-1]["final"]
+
+    assert result["grounded"] is True
+    assert f"(page {page})" in result["answer"]
+    assert store.queries == [need]
+
+
+def test_alarm_reminder_and_calendar_are_isolated_in_one_request():
+    needs = [
+        "How do I set an alarm?",
+        "How do I create a reminder?",
+        "How do I add a calendar event?",
+    ]
+    pipeline, store = _multipart_pipeline(
+        "How do I set an alarm, create a reminder, and add a calendar event?", needs,
+    )
+
+    result = list(pipeline.stream_answer(
+        "How do I set an alarm, create a reminder, and add a calendar event?"
+    ))[-1]["final"]
+
+    assert result["grounded"] is True
+    assert store.queries == needs
+    assert all(f"(page {page})" in result["answer"] for page in (85, 94, 70))
+
+
+def test_three_independent_topics_do_not_share_a_retrieval_result_limit():
+    needs = [
+        "How do I adjust volume?",
+        "How do I use Pano?",
+        "How do I take a screenshot?",
+    ]
+    pipeline, store = _multipart_pipeline("Volume, Pano, and screenshot instructions.", needs)
+
+    result = list(pipeline.stream_answer("Volume, Pano, and screenshot instructions."))[-1]["final"]
+
+    assert result["grounded"] is True
+    assert store.queries == needs
+    assert all(f"(page {page})" in result["answer"] for page in (11, 79, 17))
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "كيف أضبط منبهًا، وأنشئ تذكيرًا، وأضيف حدثًا إلى التقويم؟",
+        "ازاي أظبط منبه وأعمل تذكير وأضيف حدث في التقويم؟",
+    ],
+)
+def test_arabic_and_egyptian_arabic_multi_part_requests_keep_independent_citations(question):
+    needs = [
+        "How do I set an alarm?",
+        "How do I create a reminder?",
+        "How do I add a calendar event?",
+    ]
+    pipeline, _store = _multipart_pipeline(question, needs, language="ar")
+
+    result = list(pipeline.stream_answer(question))[-1]["final"]
+
+    assert result["grounded"] is True
+    assert "خطوات alarm." in result["answer"]
+    assert all(f"(page {page})" in result["answer"] for page in (85, 94, 70))
+
+
+def test_supported_and_unsupported_parts_keep_the_supported_result_visible():
+    class _Store:
+        def similarity_search_with_score(self, query, **_kwargs):
+            if "alarm" in query.lower():
+                return [(_doc(85, text="Create an alarm in Clock."), 0.88)]
+            return []
+
+    pipeline = _pipeline([
+        '{"standalone_question":"Set an alarm and predict the weather.",'
+        '"needs_clarification":false,"answer_language":"en",'
+        '"information_needs":["How do I set an alarm?", "How do I predict the weather?"],'
+        '"relationship":"independent_procedures"}',
+        '{"claims":[{"text":"Create an alarm in Clock.","evidence_ids":[1]}]}',
+        '{"supported_claim_indexes":[0]}',
+    ])
+    pipeline.vectorstore = _Store()
+
+    result = list(pipeline.stream_answer("Set an alarm and predict the weather."))[-1]["final"]
+
+    assert result["grounded"] is True
+    assert "(page 85)" in result["answer"]
+    assert "requested part 2" in result["answer"]
+
+
+def test_repeated_identical_multi_part_requests_are_deterministic_with_mocked_dependencies():
+    question = "How do I set an alarm, create a reminder, and add a calendar event?"
+    needs = ["How do I set an alarm?", "How do I create a reminder?", "How do I add a calendar event?"]
+
+    first_pipeline, _ = _multipart_pipeline(question, needs)
+    second_pipeline, _ = _multipart_pipeline(question, needs)
+    first = list(first_pipeline.stream_answer(question))[-1]["final"]
+    second = list(second_pipeline.stream_answer(question))[-1]["final"]
+
+    assert first == second
