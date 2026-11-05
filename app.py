@@ -19,7 +19,7 @@ import chainlit as cl
 from engineio.payload import Payload
 
 from src.config import settings
-from src.rag_graph import RagPipeline
+from src.rag_graph import GuideRetrievalUnavailable, RagPipeline
 
 logger = logging.getLogger(__name__)
 
@@ -44,24 +44,18 @@ WELCOME = (
 
 
 _RTL_CHARACTERS = re.compile(r"[\u0590-\u08FF]")
-_INLINE_PAGE_CITATION = re.compile(r"\(page\s+\d+\)")
 
 
 def _is_rtl(text: str) -> bool:
     return bool(_RTL_CHARACTERS.search(text))
 
 
-def _format_answer_for_display(answer: str, rtl: bool) -> str:
-    if not rtl:
-        return answer
-    # Keep the English citation as one left-to-right unit inside Arabic/Hebrew text.
-    return _INLINE_PAGE_CITATION.sub(lambda match: f"\u2066{match.group(0)}\u2069", answer)
-
-
 def _format_sources(sources: list[dict], rtl: bool = False) -> str:
     lines = []
     for s in sources:
-        loc = f"الصفحة \u2066{s['page']}\u2069" if rtl else f"page {s['page']}"
+        # Keep the deterministic citation token byte-for-byte identical in every
+        # output language. The UI isolates its direction at render time.
+        loc = f"(page {s['page']})"
         if s.get("section"):
             loc += f" — {s['section']}"
         if s.get("chapter"):
@@ -111,6 +105,12 @@ async def on_chat_start():
         # Build the pipeline once per session. This loads the embedding model and
         # opens the Pinecone connection off the event loop.
         pipeline = await cl.make_async(RagPipeline)(provider)
+    except GuideRetrievalUnavailable:
+        logger.exception("guide_retrieval_unavailable_during_startup")
+        await cl.Message(
+            content="I couldn't access the iPhone User Guide right now. Please try again shortly."
+        ).send()
+        return
     except Exception:
         logger.exception("Failed to initialise the RAG pipeline")
         await cl.Message(
@@ -155,6 +155,12 @@ async def on_message(message: cl.Message):
             event = await cl.make_async(_next_stream_event)(stream)
         else:
             raise RuntimeError("Answer stream ended without a final result")
+    except GuideRetrievalUnavailable:
+        logger.exception("guide_retrieval_unavailable trace_id=%s", trace_id)
+        await cl.Message(
+            content="I couldn't access the iPhone User Guide right now. Please try again shortly."
+        ).send()
+        return
     except Exception:
         logger.exception("chat_request_failed trace_id=%s", trace_id)
         await cl.Message(
@@ -163,8 +169,10 @@ async def on_message(message: cl.Message):
         return
 
     answer = result["answer"]
-    rtl = _is_rtl(question)
-    answer = _format_answer_for_display(answer, rtl)
+    # This is presentation-only. Base direction follows the rendered answer, not
+    # the retrieval question, so an English question requesting Arabic output is
+    # displayed correctly and an English reply after an Arabic turn remains LTR.
+    rtl = _is_rtl(answer)
     if result["grounded"] and result["sources"]:
         answer = f"{answer}\n\n{_format_sources(result['sources'], rtl)}"
 
@@ -174,7 +182,9 @@ async def on_message(message: cl.Message):
     # Persist the turn so the next question has the conversation as context.
     history.append({"role": "user", "content": question})
     history.append({"role": "assistant", "content": result["answer"]})
-    cl.user_session.set("history", history)
+    # Retain only enough untrusted conversational context to resolve a follow-up.
+    # The pipeline independently applies this bound before contextualisation.
+    cl.user_session.set("history", history[-settings.max_history_messages:])
 
 
 if __name__ == "__main__":

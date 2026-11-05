@@ -54,9 +54,9 @@ If you change `PORT` in `.env`, map that port instead, e.g. `PORT=9000` →
 | Chat / generation | **Claude Opus 4.8** — `claude-opus-4-8` (Anthropic), or **GPT-6 Luna** — `gpt-6-luna` (OpenAI) | The user chooses a provider when a chat starts; if it fails, the other provider is tried automatically. |
 | Embeddings      | **BAAI/bge-small-en-v1.5** (384-dim)               | open model run in-container via `sentence-transformers`; no extra API key, and it let me benchmark retrieval offline |
 
-All are configurable (`ANTHROPIC_CHAT_MODEL`, `OPENAI_CHAT_MODEL`, `EMBEDDING_MODEL`) — see `.env.example`. If you
-swap the embedding model, the index dimension (`EMBEDDING_DIM`) and the ingested vectors
-have to match.
+The chat models are configurable (`ANTHROPIC_CHAT_MODEL`, `OPENAI_CHAT_MODEL`). The
+embedding model and dimension are intentionally locked to the pre-ingested Pinecone
+index; changing either requires re-ingestion and a matching image build.
 
 ## Stack
 
@@ -105,11 +105,13 @@ Pinned versions are in [`requirements.txt`](requirements.txt).
   replies *"I couldn't find this in the iPhone User Guide."* when the excerpts don't
   answer the question. Citations are dropped on any refusal. Details and the measured
   threshold are in [`docs/retrieval.md`](docs/retrieval.md).
-- **Page/section citations on every answer.** Each grounded answer ends with a
-  **Sources** block (`page — section (chapter)`) built deterministically from the chunk
-  metadata, plus inline `(page N)` references in the prose.
-- **Multi-turn memory.** Conversation history is kept per session; follow-up questions
-  are rewritten to standalone form for retrieval and passed to the model for context.
+- **Page/section citations on every answer.** The answer model returns claims linked to
+  excerpt IDs. A separate evidence check must approve every claim; the application then
+  renders inline page references and the **Sources** block exclusively from the approved
+  chunks' metadata. Model-written page numbers are never trusted.
+- **Multi-turn memory.** Recent conversation is kept per session only to rewrite a
+  follow-up into a standalone retrieval query. Final factual generation receives fresh
+  guide excerpts, not raw prior assistant answers.
 
 ---
 

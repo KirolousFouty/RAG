@@ -13,3 +13,38 @@
 .flex.flex-col.flex-grow.overflow-y-auto > :first-child {
   margin-top: auto !important;
 }
+
+/* Arabic assistant messages only. The marker and dir attribute are set by the
+ * supported Chainlit custom-JS hook in rtl-message.js. User messages and all
+ * English assistant messages retain Chainlit's normal LTR styling. */
+[data-step-type="assistant_message"] .message-content.rtl-assistant-message {
+  direction: rtl;
+  text-align: right;
+}
+
+/* Let each Markdown block establish its direction from its own first strong
+ * character. This prevents an English chapter name or a page citation from
+ * changing the base direction of surrounding Arabic prose. */
+[data-step-type="assistant_message"] .rtl-assistant-message [role="article"],
+[data-step-type="assistant_message"] .rtl-assistant-message li,
+[data-step-type="assistant_message"] .rtl-assistant-message blockquote {
+  direction: rtl;
+  text-align: right;
+  unicode-bidi: plaintext;
+}
+
+/* Technical identifiers and fenced code retain their conventional LTR layout. */
+[data-step-type="assistant_message"] .rtl-assistant-message pre,
+[data-step-type="assistant_message"] .rtl-assistant-message code {
+  direction: ltr;
+  text-align: left;
+  unicode-bidi: isolate;
+}
+
+/* The script wraps the unchanged `(page N)` text in a semantic bdi element so
+ * its parentheses and digits remain an LTR unit at the end of an Arabic claim. */
+[data-step-type="assistant_message"] .rtl-assistant-message .rtl-citation {
+  direction: ltr;
+  unicode-bidi: isolate;
+  display: inline;
+}

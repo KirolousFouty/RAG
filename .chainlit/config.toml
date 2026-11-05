@@ -20,7 +20,9 @@ persist_user_env = false
 mask_user_env = false
 
 # Authorized origins
-allow_origins = ["*"]
+# Local Docker use is served from this origin. Add an explicitly deployed origin here
+# rather than accepting arbitrary browser origins.
+allow_origins = ["http://localhost:8000", "http://127.0.0.1:8000"]
 
 # Avoid Engine.IO long-polling payload batching. The local browser and Chainlit
 # server both support WebSocket, and forcing it prevents intermittent
@@ -128,7 +130,7 @@ confirm_new_chat = true
 # description = ""
 
 # Chain of Thought (CoT) display mode. Can be "hidden", "tool_call" or "full".
-cot = "full"
+cot = "hidden"
 
 # Specify a CSS file that can be used to customize the user interface.
 # The CSS file can be served from the public directory or via an external link.
@@ -137,9 +139,9 @@ custom_css = "/public/custom.css"
 # Specify additional attributes for a custom CSS file
 # custom_css_attributes = "media=\"print\""
 
-# Specify a JavaScript file that can be used to customize the user interface.
-# The JavaScript file can be served from the public directory.
-# custom_js = "/public/test.js"
+# Chainlit 2.11 does not expose a message-level `dir` attribute. This narrowly
+# scoped enhancement marks only Arabic assistant messages as RTL after rendering.
+custom_js = "/public/rtl-message.js"
 
 # The style of alert boxes. Can be "classic" or "modern".
 alert_style = "classic"

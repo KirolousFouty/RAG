@@ -24,6 +24,10 @@ def _float(name: str, default: float) -> float:
     return float(os.getenv(name, default))
 
 
+def _bool(name: str, default: bool = False) -> bool:
+    return os.getenv(name, str(default)).strip().lower() in {"1", "true", "yes", "on"}
+
+
 @dataclass(frozen=True)
 class Settings:
     # --- Secrets / connections ---
@@ -61,11 +65,29 @@ class Settings:
     # off-topic; the authoritative grounding check is the model's refusal instruction
     # over the actual excerpts. Both numbers are justified in docs/retrieval.md.
     min_relevance_score: float = float(os.getenv("MIN_RELEVANCE_SCORE", "0.55"))
+    # Keep untrusted user input and conversational context within a predictable
+    # provider/context budget.  History is used only to resolve a follow-up.
+    max_question_chars: int = _int("MAX_QUESTION_CHARS", 4000)
+    max_history_messages: int = _int("MAX_HISTORY_MESSAGES", 12)
+    # Disabled by default because contextualized queries may contain user text.
+    enable_rag_diagnostics: bool = _bool("ENABLE_RAG_DIAGNOSTICS")
 
     # --- UI ---
     port: int = _int("PORT", 8000)
     # Seconds between displayed characters while streaming a response.
     stream_char_delay: float = _float("STREAM_CHAR_DELAY", 0.018)
+
+    def __post_init__(self):
+        # The deployed Pinecone vectors were created with this exact embedding space.
+        # Accepting an arbitrary environment override would produce invalid retrieval
+        # and make Docker download a model that was not baked into the image.
+        if self.embedding_model != "BAAI/bge-small-en-v1.5" or self.embedding_dim != 384:
+            raise ValueError(
+                "EMBEDDING_MODEL and EMBEDDING_DIM must match the pre-ingested "
+                "BAAI/bge-small-en-v1.5 / 384-dimension Pinecone index."
+            )
+        if self.max_question_chars < 1 or self.max_history_messages < 1:
+            raise ValueError("MAX_QUESTION_CHARS and MAX_HISTORY_MESSAGES must be positive.")
 
 
 settings = Settings()
