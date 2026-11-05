@@ -16,11 +16,24 @@ import asyncio
 import uuid
 
 import chainlit as cl
+from engineio.payload import Payload
 
 from src.config import settings
 from src.rag_graph import RagPipeline
 
 logger = logging.getLogger(__name__)
+
+# These libraries log cache validation and optional-file probes at INFO/WARNING
+# during the first embedding request. They are not application failures; retain
+# our own pipeline logs while hiding that startup noise.
+for _noisy_logger in ("httpx", "huggingface_hub", "sentence_transformers", "transformers"):
+    logging.getLogger(_noisy_logger).setLevel(logging.ERROR)
+
+# Chainlit's initial client connection can legitimately batch more than
+# python-engineio's very conservative default of 16 packets. Raise the cap before
+# Uvicorn starts serving requests; it remains bounded to limit request work.
+_ENGINEIO_MAX_DECODE_PACKETS = 100
+Payload.max_decode_packets = max(Payload.max_decode_packets, _ENGINEIO_MAX_DECODE_PACKETS)
 
 WELCOME = (
     "**iPhone User Guide assistant**\n\n"

@@ -16,8 +16,14 @@ from functools import lru_cache
 
 from langchain_core.embeddings import Embeddings
 from sentence_transformers import SentenceTransformer
+from transformers.utils.logging import disable_progress_bar
 
 QUERY_INSTRUCTION = "Represent this sentence for searching relevant passages: "
+
+# Transformer weight materialisation is an implementation detail, not useful app
+# progress. Disabling its progress bar keeps Chainlit's terminal output focused on
+# retrieval and provider failures.
+disable_progress_bar()
 
 
 @lru_cache(maxsize=2)

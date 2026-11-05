@@ -25,3 +25,4 @@ chainlit==2.11.1
 # Config / utils
 python-dotenv==1.2.1
 PyYAML==6.0.3
+langdetect==1.0.9
