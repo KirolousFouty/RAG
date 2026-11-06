@@ -1,39 +1,67 @@
 # Retrieval, grounding & citations
 
 This covers how the running app turns a question into a grounded, cited answer, and
-how it refuses when it should. The pipeline is a small LangGraph state machine
-(`src/rag_graph.py`):
+how it refuses when it should. The pipeline is implemented in `src/rag_graph.py`.
+For one ordinary information need, its core path is:
 
 ```
-contextualize -> retrieve -> [grounded?] --yes--> generate -> answer + sources
-                                  \--no--> refuse -> "I couldn't find this..."
+sanitize -> contextualize -> retrieve -> [relevant?] --no--> refuse
+                                             |
+                                            yes
+                                             v
+                              generate claims + evidence IDs -> validate claims
+                                                              |             |
+                                                             pass          fail
+                                                              |             |
+                                                              v             v
+                                             render citations from metadata  refuse
 ```
+
+Guide-wide summary requests take a separate path: rather than pretending that a
+top-5 search represents the manual, the app supplies all extracted, page-tagged PDF
+segments to a summary pass and accepts only claims with valid source pages.
 
 ## Retrieval
 
-For each turn I embed the (contextualised) question with bge-small and run a top-5
-cosine similarity search against Pinecone. `k=5` was enough for hit@5 = 1.00 on the
-eval set, so going wider would only add noise (and tokens) to the model's context.
+For each information need, the app embeds the contextualised English question with
+bge-small and runs a top-5 cosine similarity search against Pinecone. `k=5` was enough
+for hit@5 = 1.00 on the retrieval eval set, so going wider would only add noise (and
+tokens) to the model's context. A small terminology layer adds guide terms for a few
+high-value synonyms (for example, “background” also searches for “wallpaper”), and
+chapter-number questions include the corresponding chapter title.
+
+Multi-part requests are not embedded as one blended question. The contextualizer can
+return up to five independent information needs; otherwise a bounded splitter preserves
+explicit task boundaries and asks the model to decompose visibly compound requests.
+Each need is retrieved, generated, validated, and retried in isolation. The final
+answer combines supported parts in user-request order and clearly marks any part that
+lacks support. A request about whether two features interact includes a separate
+interaction query, so evidence for each feature alone is never treated as evidence of
+their relationship.
 
 ## Multi-turn memory
 
-Memory is per-session and has two distinct jobs, which I keep separate on purpose:
+Memory is per-session and has one deliberately limited job:
 
 - **`contextualize`** rewrites a follow-up into a standalone question *for retrieval*.
   "What about on the 4s?" embeds terribly on its own; rewritten to "Does Touch ID work
-  on the iPhone 4s?" it retrieves the right page. This is a cheap LLM rewrite that only
-  runs when there's prior history.
-- **`generate`** is given the prior turns so the *answer* reads as a conversation. But
-  the system prompt is explicit that earlier turns are only for understanding what the
-  user means — the facts must still come from the excerpts retrieved this turn.
+  on the iPhone 4s?" it retrieves the right page. The same bounded classification step
+  also normalises a first-turn question and detects ambiguity.
+- Answer generation and validation receive the resolved question and freshly retrieved
+  excerpts, not raw conversation history. Prior turns can identify the topic but
+  cannot become factual evidence.
 
-The Chainlit app holds the history in the user session and passes it in each turn, so
-the bot "remembers" within a session without any server-side state.
+The Chainlit app keeps a bounded recent history in the user session, so the bot
+"remembers" within a session without persistent server-side conversation storage. User
+text in both the current message and history is sanitised before it reaches a model;
+prompt-control clauses are removed while a legitimate guide question in the same
+message is retained. If a follow-up has no clear antecedent, the pipeline asks which
+feature the user means instead of guessing.
 
-## Strict grounding — two layers
+## Strict grounding — three layers
 
-The bot must answer only from the guide and say so otherwise. I don't trust a single
-mechanism for this; there are two layers, and either one alone would be weaker:
+The bot must answer only from the guide and say so otherwise. It does not rely on a
+single instruction-following step; three checks cover different failure modes:
 
 **Layer 1 — a relevance gate, before the model is even called.** If retrieval is empty
 or the best cosine score is below `MIN_RELEVANCE_SCORE`, the graph branches straight to
@@ -55,29 +83,48 @@ enough not to false-refuse a real, oddly-worded question, high enough to drop th
 blatantly irrelevant (capital of France, World Cup). It is a coarse pre-filter, not the
 whole grounding story.
 
-**Layer 2 — the model's refusal instruction, the authoritative check.** The system
-prompt (`src/prompts.py`) tells the model, in plain terms, to use only the excerpts and
-to return an explicit structured refusal when they don't answer the question. This is
-what catches the overlap region: a question about baking bread scores ~0.575 (above the
-gate), retrieves some iPhone text, and the model correctly refuses because that text
-doesn't answer it. The graph renders the refusal message itself and drops citations — I
-never cite sources for a non-answer.
+**Layer 2 — evidence-linked claim generation.** The answer model must return either an
+explicit structured refusal or a small set of claims, each paired with one or more
+retrieved excerpt IDs. It receives only the current excerpts and resolved question.
+This catches the overlap region: a question about baking bread can score above the
+coarse gate and retrieve iPhone text, but the model should refuse because that text
+does not answer it.
 
-I validated all four paths offline with stubbed retrieval and model: strong match →
-grounded + cited; weak score → hard refuse (no model call); gate-passing but
-unanswerable → model refuse + citations dropped; empty retrieval → refuse.
+**Layer 3 — independent claim validation.** A second model call checks every proposed
+claim against its cited excerpts *and* the resolved question. Every claim must pass;
+malformed output, an unsupported claim, or a partial validation result becomes a
+refusal. The application, not the model, renders the refusal message and drops
+citations for every non-answer.
+
+Explicit iPhone model references also receive a deterministic scope check before
+retrieval: this iOS 7.1 guide covers iPhone 4, 4s, 5, 5c, and 5s. This prevents a
+semantically similar passage for a supported device from answering a question about an
+unsupported model. Temporary contextualization or validation failures are retried a
+bounded number of times, always against the same retrieved evidence.
 
 ## Citations
 
-Every grounded answer carries its sources two ways:
+Every grounded answer carries its sources two ways, both derived after validation:
 
-1. **Inline**, because the system prompt asks the model to cite the page next to each
-   claim, e.g. "Turn on Do Not Disturb in Settings (page 32)."
-2. **A deterministic "Sources" block** appended in code (`app.py`) from the chunk
-   metadata — unique, page-ordered `page — section (chapter)` lines. This doesn't rely
-   on the model remembering to cite; it's built from the exact chunks that fed the
-   answer, so it's always present and always accurate.
+1. **Inline** page citations are appended to each approved claim from the pages in its
+   validated evidence IDs, e.g. `Turn on Do Not Disturb in Settings (page 32)`.
+   Provider-written page numbers are stripped and never trusted.
+2. **A deterministic "Sources" block** is appended in `app.py` from the metadata of
+   those approved evidence chunks — unique, page-ordered `page — section (chapter)`
+   lines. Retrieved chunks that did not support a rendered claim are omitted.
 
 The page/section in that block is the same metadata the parser pulled from the footer
 and headings, carried untouched through ingestion — so a citation always points at the
 page a reader can actually turn to.
+
+## Language and delivery
+
+The contextualizer translates the information need to English for retrieval while
+retaining the requested answer language. After claim validation, claim text can be
+translated before citations are attached, which keeps citation tokens deterministic.
+Arabic has dedicated refusal and partial-answer templates; other languages use a
+bounded translation fallback. The UI detects right-to-left answers and labels the
+Sources block in Arabic when appropriate.
+
+Streaming is presentation-only: Chainlit displays the final, fully validated answer
+with a character-by-character effect, never an unvalidated provider draft.

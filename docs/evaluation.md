@@ -20,10 +20,11 @@ and the numbers that picked structure-aware 800/120 + bge-small — are in
 
 ## Layer 2 — generated answer (DeepEval, `eval/deepeval_eval.py`)
 
-Retrieval being right doesn't guarantee the *answer* is grounded — the model could
-still wander off the context or miss the question. **Rana suggested in the interview
-that I use DeepEval to evaluate the LLM side**, which was a good call: it gives me
-answer-level metrics with an LLM judge instead of me eyeballing outputs.
+Retrieval being right doesn't guarantee the *answer* is grounded — a model could
+still choose the wrong excerpt, overstate it, or miss part of the question. The
+runtime reduces that risk with evidence-linked claims and an independent validation
+pass (see [`retrieval.md`](retrieval.md)); DeepEval provides a separate answer-level
+check rather than relying on manual inspection.
 
 DeepEval uses the configured OpenAI chat model as the judge (`eval/openai_judge.py`), so the
 application and evaluation share one provider and one key. I run three metrics over a handful
@@ -47,8 +48,9 @@ Averaged over the four questions (OpenAI model as judge):
 | Contextual Relevancy  | 0.20    | only a small fraction of the *retrieved* text is on-topic — see below |
 
 **Faithfulness = 1.00 is the result I care about most.** It's direct evidence that the
-answers stay inside the guide rather than drifting into the model's own knowledge —
-exactly the grounding contract the bot is built around.
+answers in this recorded four-question run stayed inside the guide rather than
+drifting into the model's own knowledge. It is a small regression signal, not proof
+that every future question will be perfect.
 
 **Answer Relevancy = 0.83** is good and the gap is mostly a measurement artifact: the
 judge treats the mandatory `(page N)` citation as a statement that doesn't answer the
@@ -71,6 +73,7 @@ it does, 1.00) than to retrieve too narrowly and miss the answer.
 Layer 1 is fast and free, so it drives the design decisions (chunking, embedding,
 threshold). Layer 2 is slower and costs API calls, so I use it as a quality gate on the
 end product — confirming that good retrieval is actually turning into grounded,
-on-topic answers. Strict grounding and the explicit refusal are additionally checked by
-the four-way logic test described in [`retrieval.md`](retrieval.md) and by the manual
-out-of-guide questions in the README.
+on-topic answers. The automated test suite additionally covers refusal paths,
+validated citation rendering, multi-part requests, language/RTL presentation, and
+streaming behaviour. Those checks are complementary to the runtime evidence
+validation; they do not replace live-model evaluation.

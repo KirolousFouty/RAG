@@ -60,7 +60,7 @@ index; changing either requires re-ingestion and a matching image build.
 
 ## Stack
 
-- **Orchestration:** LangChain + LangGraph (the pipeline is a small state graph)
+- **Orchestration:** LangChain, with a compiled LangGraph state-graph definition
 - **UI:** Chainlit
 - **Vector store:** Pinecone (serverless, free tier; cosine, 384-dim)
 - **PDF parsing:** PyMuPDF
@@ -76,12 +76,23 @@ Pinned versions are in [`requirements.txt`](requirements.txt).
   PDF ─► pdf_loader ─► chunking ─► embeddings ─► Pinecone
         (fitz, layout)  (800/120)  (bge-small)   (cosine, 384-dim)
 
-              serving (per question — app.py + src/rag_graph.py)
-  user ─► contextualize ─► retrieve(top-5) ─► grounded? ─no─► "I couldn't find this…"
-                                                  │yes
-                                                  ▼
-                                   generate (GPT-6 Luna) ─► answer + Sources
+              serving (per request — app.py + src/rag_graph.py)
+  user ─► sanitize ─► contextualize ─► retrieve(top-5) ─► relevant? ─no─► refuse
+                                                            │yes
+                                                            ▼
+                                             generate claims + evidence IDs
+                                                            │
+                                                            ▼
+                                               independently validate claims
+                                                    │                 │
+                                                   pass              fail
+                                                    │                 │
+                                                    ▼                 ▼
+                                    render deterministic citations     refuse
 ```
+
+Guide-wide summary requests bypass top-k retrieval and use all extracted, page-tagged
+PDF segments in a separate summary pass.
 
 - **`src/pdf_loader.py`** — parses the guide with PyMuPDF, using font size and the
   page footer to recover the chapter, section, and printed page for every passage, and
@@ -90,8 +101,10 @@ Pinned versions are in [`requirements.txt`](requirements.txt).
   metadata on every chunk.
 - **`src/embeddings.py`** — bge-small wrapper (applies the bge query instruction).
 - **`src/vectorstore.py`** — Pinecone connection + similarity search with scores.
-- **`src/rag_graph.py`** — the LangGraph pipeline: contextualise → retrieve → grounding
-  gate → generate.
+- **`src/rag_graph.py`** — request sanitisation, contextualisation, per-need retrieval,
+  claim generation, independent evidence validation, localisation, and guide-wide
+  summaries. It also defines a compiled LangGraph state graph; the current UI request
+  path orchestrates those helpers directly.
 - **`src/ingest.py`** — standalone, re-runnable ingestion script.
 - **`app.py`** — Chainlit UI; per-session conversation memory; renders the Sources block.
 
@@ -100,11 +113,11 @@ Pinned versions are in [`requirements.txt`](requirements.txt).
 - **Strictly grounded.** The model is instructed to use only the retrieved excerpts and
   given no licence to use outside knowledge. Earlier turns are used only to interpret
   the question, never as a source of facts.
-- **Explicit "not in the document" fallback.** Two layers: a relevance gate refuses
-  before the model is called when retrieval is empty/too weak; and the model returns a
-  structured refusal when the excerpts don't answer the question. Citations are dropped
-  on any refusal. Details and the measured
-  threshold are in [`docs/retrieval.md`](docs/retrieval.md).
+- **Explicit "not in the document" fallback.** Three layers: a relevance gate rejects
+  empty or weak retrieval before answer generation; the model returns either a
+  structured refusal or evidence-linked claims; and an independent validation pass
+  must approve every claim. Citations are dropped on any refusal. Details and the
+  measured threshold are in [`docs/retrieval.md`](docs/retrieval.md).
 - **Page/section citations on every answer.** The answer model returns claims linked to
   excerpt IDs. A separate evidence check must approve every claim; the application then
   renders inline page references and the **Sources** block exclusively from the approved
@@ -112,6 +125,9 @@ Pinned versions are in [`requirements.txt`](requirements.txt).
 - **Multi-turn memory.** Recent conversation is kept per session only to rewrite a
   follow-up into a standalone retrieval query. Final factual generation receives fresh
   guide excerpts, not raw prior assistant answers.
+- **Multi-part and multilingual requests.** Independent information needs are retrieved
+  and validated separately before their results are combined. Retrieval is normalised to
+  English; validated claims can then be localised, while citations remain deterministic.
 
 ---
 
