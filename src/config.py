@@ -49,6 +49,9 @@ class Settings:
     # structured responses instead of allowing a reasoning model to exhaust its
     # budget before emitting JSON.
     openai_max_completion_tokens: int = _int("OPENAI_MAX_COMPLETION_TOKENS", 2048)
+    # Whole-guide summaries receive the complete extracted PDF, so reserve room
+    # for a useful synthesis beyond the normal question-answer budget.
+    openai_summary_max_completion_tokens: int = _int("OPENAI_SUMMARY_MAX_COMPLETION_TOKENS", 4096)
     # Contextualization, claim extraction, and evidence checks are bounded routing
     # tasks, so low reasoning effort keeps latency and token use predictable.
     openai_reasoning_effort: str = os.getenv("OPENAI_REASONING_EFFORT", "low")
@@ -76,7 +79,7 @@ class Settings:
     # --- UI ---
     port: int = _int("PORT", 8000)
     # Seconds between displayed characters while streaming a response.
-    stream_char_delay: float = _float("STREAM_CHAR_DELAY", 0.018)
+    stream_char_delay: float = _float("STREAM_CHAR_DELAY", 0.009)
 
     def __post_init__(self):
         # The deployed Pinecone vectors were created with this exact embedding space.
@@ -91,10 +94,11 @@ class Settings:
             self.max_question_chars < 1
             or self.max_history_messages < 1
             or self.openai_max_completion_tokens < 1
+            or self.openai_summary_max_completion_tokens < 1
         ):
             raise ValueError(
                 "MAX_QUESTION_CHARS, MAX_HISTORY_MESSAGES, and "
-                "OPENAI_MAX_COMPLETION_TOKENS must be positive."
+                "OPENAI_MAX_COMPLETION_TOKENS, and OPENAI_SUMMARY_MAX_COMPLETION_TOKENS must be positive."
             )
 
 

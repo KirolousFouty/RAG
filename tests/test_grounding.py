@@ -6,13 +6,8 @@ import json
 import pytest
 
 import src.rag_graph as rag_graph
-from src.prompts import (
-    CLAIM_VALIDATION_PROMPT,
-    CLARIFICATION_REPLY,
-    GUIDE_SUMMARY,
-    GUIDE_SUMMARY_SOURCES,
-    NO_CONTEXT_REPLY,
-)
+from src.prompts import CLAIM_VALIDATION_PROMPT, CLARIFICATION_REPLY, NO_CONTEXT_REPLY
+from src.pdf_loader import Segment
 from src.rag_graph import (
     _OpenAIChatModel,
     GuideRetrievalUnavailable,
@@ -414,16 +409,31 @@ def test_evidence_supported_but_irrelevant_claim_is_rejected_by_validator():
     assert "<question>Can panorama mode be used on iPhone 4s?</question>" in pipeline.llm.messages[-1][1].content
 
 
-def test_whole_guide_summary_sources_are_fixed_and_separate_from_retrieval():
-    pipeline = _pipeline([])
+def test_whole_guide_summary_is_generated_from_extracted_pdf_segments(monkeypatch):
+    pipeline = _pipeline([
+        '{"sections":[{"heading":"Guide overview","claims":['
+        '{"text":"iPhone overview","source_pages":[8]},'
+        '{"text":"Phone features","source_pages":[12]}]}]}'
+    ])
+    segments = [
+        Segment("iPhone overview", 8, 12, "Chapter 1: iPhone at a Glance", "Overview"),
+        Segment("Phone features", 12, 16, "Chapter 1: iPhone at a Glance", "Features"),
+    ]
+    monkeypatch.setattr(rag_graph, "load_segments", lambda _path: segments)
+
     result = pipeline._guide_summary_result()
 
-    assert [source["page"] for source in GUIDE_SUMMARY_SOURCES] == [2, 3, 4, 5, 6, 7, 8]
-    assert result["answer"] == GUIDE_SUMMARY
-    assert result["sources"] == list(GUIDE_SUMMARY_SOURCES)
+    assert result["answer"] == (
+        "## Guide overview\n\n"
+        "- iPhone overview (page 8)\n"
+        "- Phone features (page 12)"
+    )
+    assert [source["page"] for source in result["sources"]] == [8, 12]
     assert result["context"] == []
-    for topic in ("Getting started", "Communication", "Accessibility and support"):
-        assert topic in result["answer"]
+    request = pipeline.llm.messages[0]
+    assert "Requested detail: brief" in request[1].content
+    assert "[Page 8 | Chapter 1: iPhone at a Glance | Overview]" in request[1].content
+    assert "iPhone overview" in request[1].content
 
 
 def test_contextualization_separates_english_retrieval_from_requested_arabic_output():

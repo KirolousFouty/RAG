@@ -32,7 +32,7 @@ knowledge about iPhones, Apple, or anything else.
 must come from the excerpts in the current turn.
 6. For a scoped request to summarize one feature, summarize only the supplied excerpts. \
 Do not stitch together unrelated excerpts. A request for an overview of the whole guide \
-is handled before this prompt with a verified table-of-contents summary.
+is handled before this prompt by a dedicated LLM pass over the extracted PDF source.
 """
 
 CLAIM_VALIDATION_PROMPT = """You are a strict evidence and relevance validator for an
@@ -58,65 +58,8 @@ NO_CONTEXT_REPLY = "I couldn't find this in the iPhone User Guide."
 CLARIFICATION_REPLY = "Which feature are you referring to?"
 
 # The loader intentionally excludes the contents pages from retrieval because they are
-# navigation, not useful evidence for feature questions. A whole-guide overview is the
-# exception: it needs that complete map of the guide, so keep a reviewed response and
-# its table-of-contents citations in code rather than hoping top-k retrieval happens to
-# return representative chapters.
-GUIDE_SUMMARY = """## iPhone User Guide summary
-
-This guide is for **iOS 7.1** on iPhone 4, 4s, 5, 5c, and 5s, so some screens and features may differ on newer iPhones. (page 8)
-
-It covers:
-
-- **Getting started:** iPhone hardware, SIM setup, activation, Wi-Fi, Apple ID, iCloud, iTunes syncing, and device settings.
-- **Core controls:** apps, typing and dictation, Siri, search, Control Center, notifications, sharing, AirDrop, Bluetooth, privacy, security, battery, and travel.
-- **Communication:** Phone, voicemail, Contacts, Mail, Messages, FaceTime, and Safari.
-- **Media and creativity:** Music, Photos, Camera, Videos, iBooks, Podcasts, Voice Memos, and iTunes.
-- **Everyday tools:** Calendar, Weather, Clock, Maps, Notes, Reminders, Stocks, Compass, Calculator, and Passbook.
-- **Apps and services:** App Store, Game Center, Newsstand, Nike + iPod, iCloud sharing, and Apple account services.
-- **Accessibility and support:** VoiceOver, Zoom, Guided Access, Switch Control, international keyboards, business use, safety, troubleshooting, backups, updates, repairs, and support.
-
-I can also give you a chapter-by-chapter summary or help with a specific feature, such as Camera, Messages, Siri, or Find My iPhone."""
-
-GUIDE_SUMMARY_SOURCES = (
-    {"page": 2, "section": "Contents", "chapter": ""},
-    {"page": 3, "section": "Contents", "chapter": ""},
-    {"page": 4, "section": "Contents", "chapter": ""},
-    {"page": 5, "section": "Contents", "chapter": ""},
-    {"page": 6, "section": "Contents", "chapter": ""},
-    {"page": 7, "section": "Contents", "chapter": ""},
-    {"page": 8, "section": "iPhone overview", "chapter": "Chapter 1: iPhone at a Glance"},
-)
-
-GUIDE_DETAILED_SUMMARY = """## Detailed iPhone User Guide summary
-
-This is the **iOS 7.1** guide for iPhone 4, 4s, 5, 5c, and 5s. Features and screens can differ on newer iPhones. (page 8)
-
-### Setup and core iPhone use
-
-The guide starts with the iPhone's hardware, buttons, touchscreen gestures, status icons, and included accessories. It then explains SIM installation, activation, Wi-Fi and Internet connections, Apple ID, iCloud, iTunes syncing, international settings, and viewing the guide on the phone.
-
-The Basics chapter covers using and organizing apps, typing and dictation, Voice Control, search, Control Center, alerts and Notification Center, sound settings, Do Not Disturb, sharing, AirDrop, file transfer, Personal Hotspot, AirPlay, AirPrint, headsets, Bluetooth, restrictions, privacy, security, battery care, and travel.
-
-### Communication and browsing
-
-Dedicated chapters explain Siri, Phone, Mail, Safari, Messages, FaceTime, and Contacts. Together they cover calls and voicemail, contacts, email composition and attachments, web browsing and reading lists, text and iMessage conversations, sharing media, and video calls.
-
-### Photos, media, and reading
-
-The guide includes Music, Photos, Camera, Videos, iBooks, Podcasts, and Voice Memos. It covers playing and buying music, iTunes Radio, managing photos and videos, taking photos and recording video, editing and sharing media, watching videos, reading books and PDFs, managing podcasts, and recording audio.
-
-### Everyday apps and services
-
-Calendar, Weather, Clock, Maps, Notes, Reminders, Stocks, Game Center, Newsstand, iTunes Store, App Store, Passbook, Compass, Calculator, Nike + iPod, and related services each have their own chapter. These sections cover planning events, alarms and timers, directions, note-taking, task reminders, apps and purchases, passes, navigation, fitness tracking, and games.
-
-### Accessibility, business, and support
-
-The appendices explain accessibility features such as VoiceOver, Zoom, Guided Access, Switch Control, AssistiveTouch, hearing and captioning support, plus international keyboards and business configuration. The final appendix covers safety, handling, troubleshooting, backups, software updates, cellular settings, selling or giving away an iPhone, service, support, and recycling.
-
-Tell me whether you would like a chapter-by-chapter outline or a focused summary of a feature such as Camera, Messages, Siri, or Find My iPhone."""
-
-
+# navigation, not useful evidence for feature questions. A whole-guide overview takes a
+# dedicated LLM pass over every extracted PDF segment rather than relying on top-k search.
 def _page(meta) -> int:
     """Page numbers round-trip through Pinecone as floats; show them as ints."""
     try:

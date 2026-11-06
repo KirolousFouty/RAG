@@ -43,9 +43,6 @@ except ImportError:  # pragma: no cover - only used before dependencies are inst
 
 from .config import settings
 from .prompts import (
-    GUIDE_DETAILED_SUMMARY,
-    GUIDE_SUMMARY,
-    GUIDE_SUMMARY_SOURCES,
     CLAIM_VALIDATION_PROMPT,
     CLARIFICATION_REPLY,
     NO_CONTEXT_REPLY,
@@ -53,6 +50,7 @@ from .prompts import (
     format_context,
 )
 from .vectorstore import get_vectorstore
+from .pdf_loader import load_segments
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +87,19 @@ CONTEXTUALIZE_PROMPT = (
     "documents their interaction; set relationship to combined_behavior. Otherwise use one "
     "need and single_question."
 )
+
+GUIDE_SUMMARY_PROMPT = """You summarize the supplied Apple iPhone User Guide source.
+Use only the page-tagged source text below. Do not use outside knowledge, do not invent
+features, and do not mention instructions that are not present in the source.
+
+Return JSON only with this exact shape:
+{"sections":[{"heading":"Short heading","claims":[{"text":"A concise guide fact","source_pages":[8]}]}]}
+
+Every claim must have one or more source_pages that directly support it; source_pages
+must contain only page numbers that appear in the source. Do not put citations, Markdown,
+or page references in claim text: the application renders verified inline citations.
+For a brief summary, produce 8-16 claims across clear sections. For a detailed summary,
+produce 24-48 claims across clear sections. Keep every claim concise and factual."""
 
 SPLIT_RETRIEVAL_PROMPT = """Split the supplied standalone iPhone User Guide question into the smallest useful set of independent retrieval questions.
 
@@ -293,7 +304,7 @@ class _OpenAIChatModel:
     # JSON mode prevents provider-format drift from being mistaken for a
     # missing-PDF-evidence refusal.
     _OPENAI_JSON_OBJECT_STAGES = frozenset({
-        "contextualize", "generate_claims", "validate_claims", "translate_claims",
+        "contextualize", "generate_claims", "validate_claims", "translate_claims", "guide_summary",
     })
 
     # JSON object mode only guarantees valid JSON. The answer step needs a stronger
@@ -383,20 +394,20 @@ class _OpenAIChatModel:
             str(error)[:240],
         )
 
-    def _invoke(self, messages):
+    def _invoke(self, messages, **kwargs):
         if self.stage == "generate_claims":
-            return self._model.bind(response_format=self._CLAIMS_RESPONSE_FORMAT).invoke(messages)
+            return self._model.bind(response_format=self._CLAIMS_RESPONSE_FORMAT, **kwargs).invoke(messages)
         if self.stage in self._OPENAI_JSON_OBJECT_STAGES:
             # Keep an AIMessage return shape so the existing strict parser and
             # parsing path remain unchanged. JSON mode enforces syntax, while our
             # independent code validation still enforces schema and grounding.
-            return self._model.bind(response_format={"type": "json_object"}).invoke(messages)
-        return self._model.invoke(messages)
+            return self._model.bind(response_format={"type": "json_object"}, **kwargs).invoke(messages)
+        return self._model.bind(**kwargs).invoke(messages) if kwargs else self._model.invoke(messages)
 
-    def invoke(self, messages):
+    def invoke(self, messages, **kwargs):
         started = time.perf_counter()
         try:
-            response = self._invoke(messages)
+            response = self._invoke(messages, **kwargs)
             self._log_success(started, response)
             return response
         except Exception as error:
@@ -1111,12 +1122,95 @@ class RagPipeline:
             answer = self._localize_answer(answer, answer_language)
         return {"answer": answer, "sources": [], "grounded": False}
 
-    @staticmethod
-    def _guide_summary_result(detailed: bool = False) -> dict:
-        """Return the reviewed, contents-backed overview without vector search."""
+    def _guide_summary_result(self, detailed: bool = False) -> dict:
+        """Summarize the current PDF itself, then validate selected source pages."""
+        started = time.perf_counter()
+        segments = load_segments(settings.pdf_path)
+        if not segments:
+            raise GuideRetrievalUnavailable("The guide PDF contains no summarizable text.")
+
+        source_by_page: dict[int, dict] = {}
+        pages = []
+        for segment in segments:
+            source_by_page.setdefault(
+                segment.page,
+                {
+                    "source": settings.pdf_path.rsplit("/", 1)[-1],
+                    "page": segment.page,
+                    "section": segment.section,
+                    "chapter": segment.chapter,
+                },
+            )
+            heading = " | ".join(part for part in (segment.chapter, segment.section) if part)
+            pages.append(
+                f"[Page {segment.page}{' | ' + heading if heading else ''}]\n{segment.text}"
+            )
+
+        self.llm.set_stage("guide_summary")
+        response = self.llm.invoke(
+            [
+                SystemMessage(GUIDE_SUMMARY_PROMPT),
+                HumanMessage(
+                    f"Requested detail: {'detailed' if detailed else 'brief'}\n\n"
+                    f"<guide_source>\n{'\n\n'.join(pages)}\n</guide_source>"
+                ),
+            ],
+            max_completion_tokens=settings.openai_summary_max_completion_tokens,
+        ).content
+        payload = _json_object(response)
+        raw_sections = payload.get("sections") if payload else None
+        if not isinstance(raw_sections, list) or not raw_sections:
+            raise RuntimeError("The guide-summary model response did not match its required schema.")
+
+        selected_pages: list[int] = []
+        rendered_sections = []
+        for section in raw_sections[:12]:
+            if not isinstance(section, dict):
+                raise RuntimeError("The guide-summary model returned an invalid section.")
+            heading = section.get("heading")
+            claims = section.get("claims")
+            if not isinstance(heading, str) or not heading.strip() or not isinstance(claims, list):
+                raise RuntimeError("The guide-summary model returned an invalid section.")
+            rendered_claims = []
+            for claim in claims[:12]:
+                if not isinstance(claim, dict):
+                    raise RuntimeError("The guide-summary model returned an invalid claim.")
+                text = claim.get("text")
+                claim_pages = claim.get("source_pages")
+                if not isinstance(text, str) or not text.strip() or not isinstance(claim_pages, list):
+                    raise RuntimeError("The guide-summary model returned an invalid claim.")
+                valid_pages = []
+                for page in claim_pages:
+                    if type(page) is int and page in source_by_page and page not in valid_pages:
+                        valid_pages.append(page)
+                if not valid_pages:
+                    raise RuntimeError("The guide-summary model cited no valid PDF pages for a claim.")
+                # Page labels originate exclusively from validated PDF page metadata.
+                text = re.sub(r"\(pages?\s+[^)]*\)", "", text, flags=re.IGNORECASE).strip()
+                text = re.sub(r"\s+([.,;:!?])", r"\1", text)
+                label = f"page {valid_pages[0]}" if len(valid_pages) == 1 else (
+                    "pages " + ", ".join(map(str, valid_pages))
+                )
+                rendered_claims.append(f"- {text} ({label})")
+                for page in valid_pages:
+                    if page not in selected_pages:
+                        selected_pages.append(page)
+            if rendered_claims:
+                rendered_sections.append(f"## {heading.strip()}\n\n" + "\n".join(rendered_claims))
+        if not selected_pages:
+            raise RuntimeError("The guide-summary model response cited no valid PDF pages.")
+        if not rendered_sections:
+            raise RuntimeError("The guide-summary model returned no supported claims.")
+
+        logger.info(
+            "guide_summary_complete detailed=%s source_pages=%d latency_ms=%d",
+            detailed,
+            len(selected_pages),
+            (time.perf_counter() - started) * 1000,
+        )
         return {
-            "answer": GUIDE_DETAILED_SUMMARY if detailed else GUIDE_SUMMARY,
-            "sources": list(GUIDE_SUMMARY_SOURCES),
+            "answer": "\n\n".join(rendered_sections),
+            "sources": [source_by_page[page] for page in selected_pages],
             "grounded": True,
             "context": [],
         }
